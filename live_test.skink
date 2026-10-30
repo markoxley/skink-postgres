@@ -1,0 +1,131 @@
+// File:    live_test.skink
+// Purpose: Live integration test for skink-postgres against a real
+//          PostgreSQL server. Skipped (exit 0) unless SKINK_PG_DSN is
+//          set — test_live.sh starts a podman postgres container,
+//          exports it, and runs this binary.
+//
+//          Exercises the full v3 protocol for real: startup + auth
+//          (SCRAM-SHA-256 on modern images), extended query with bound
+//          parameters, type decoding (int/text/bool/float/timestamp/
+//          bytea/uuid), affected-row counts, and transactions.
+module main
+
+import "pg_conn"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/os"
+import "std/errors"
+
+var failures = 0
+
+// check reports a boolean assertion.
+fn check(ok: bool, what: string) {
+    if !ok {
+        println("FAIL:", what)
+        failures = failures + 1
+    }
+}
+
+// expectErr checks an errors.Error is empty.
+fn expectErr(e: errors.Error, what: string) {
+    if str.Len(e.message) > 0 {
+        check(false, str.Concat(what, str.Concat(" -> ", e.message)))
+    }
+}
+
+fn main() -> int {
+    dsn := os.Getenv("SKINK_PG_DSN")
+    if str.Len(dsn) == 0 {
+        println("SKIP live_test: SKINK_PG_DSN not set")
+        return 0
+    }
+    println("live test against", dsn)
+
+    info, perr := dbx_dsn.ParseDSN(dsn)
+    if str.Len(perr.message) > 0 {
+        println("FAIL: dsn parse", perr.message)
+        return 1
+    }
+    c, err := pg_conn.Connect(info)
+    expectErr(err, "connect")
+    if str.Len(err.message) > 0 {
+        return 1
+    }
+    check(str.Len(c.ServerVersion) > 0, "server_version reported")
+
+    // Setup table.
+    _, e1 := pg_conn.SimpleQuery(&c, "DROP TABLE IF EXISTS skink_live")
+    expectErr(e1, "drop")
+    _, e2 := pg_conn.SimpleQuery(&c,
+        "CREATE TABLE skink_live (id serial primary key, name text, score float8, ok bool, created timestamptz, data bytea)")
+    expectErr(e2, "create")
+
+    // Parameterized insert via '?' rewriting.
+    a1, e3 := pg_conn.Exec(&c, pg_conn.RewritePlaceholders(
+        "INSERT INTO skink_live (name, score, ok, created, data) VALUES (?, ?, ?, ?, ?)"),
+        []dbx_value.Value{
+            dbx_value.Text("alpha"),
+            dbx_value.Float(9.5),
+            dbx_value.Bool(true),
+            dbx_value.TimeUnixMicros(int64(1709258400123456)),
+            dbx_value.Blob("xyz", 3),
+        })
+    expectErr(e3, "insert")
+    check(a1 == int64(1), "insert affected 1")
+
+    // Select back with a bound predicate.
+    res, e4 := pg_conn.Query(&c, pg_conn.RewritePlaceholders(
+        "SELECT id, name, score, ok, created, data FROM skink_live WHERE name = ?"),
+        []dbx_value.Value{dbx_value.Text("alpha")})
+    expectErr(e4, "select")
+    check(len(res.Data) == 1, "one row")
+    if len(res.Data) == 1 {
+        r := res.Data[0]
+        check(r[0].Kind == dbx_value.KIND_INT && r[0].I64 == int64(1), "id serial 1")
+        check(str.Equal(r[1].Str, "alpha"), "name text")
+        check(r[2].Kind == dbx_value.KIND_FLOAT && r[2].F64 == 9.5, "score float")
+        check(r[3].Kind == dbx_value.KIND_BOOL && r[3].Bool, "ok bool")
+        check(r[4].Kind == dbx_value.KIND_TIME && r[4].I64 == int64(1709258400123456), "created ts")
+        check(r[5].Kind == dbx_value.KIND_BLOB && r[5].Len == 3, "data bytea")
+        if r[5].Kind == dbx_value.KIND_BLOB {
+            check(r[5].Str[0] == 120 && r[5].Str[1] == 121 && r[5].Str[2] == 122, "bytea bytes")
+        }
+    }
+
+    // Aggregates + numeric column stays text.
+    res2, e5 := pg_conn.Query(&c, "SELECT count(*)::int8, avg(score)::numeric FROM skink_live", []dbx_value.Value{})
+    expectErr(e5, "aggregate")
+    if len(res2.Data) == 1 {
+        check(res2.Data[0][0].I64 == int64(1), "count int8")
+        check(res2.Data[0][1].Kind == dbx_value.KIND_TEXT, "numeric stays text")
+    }
+
+    // Transaction rollback discards the row.
+    expectErr(pg_conn.Begin(&c), "begin")
+    check(c.TxStatus == 84, "tx status T")
+    _, e6 := pg_conn.Exec(&c, "INSERT INTO skink_live (name) VALUES ('rolledback')", []dbx_value.Value{})
+    expectErr(e6, "insert in tx")
+    expectErr(pg_conn.RollbackTx(&c), "rollback")
+    check(c.TxStatus == 73, "idle after rollback")
+    res3, _ := pg_conn.Query(&c, "SELECT count(*) FROM skink_live", []dbx_value.Value{})
+    check(res3.Data[0][0].I64 == int64(1), "rollback discarded row")
+
+    // Error surfaces and recovers.
+    _, e7 := pg_conn.SimpleQuery(&c, "SELECT * FROM no_such_table")
+    check(str.Len(e7.message) > 0, "error surfaces")
+    check(str.Contains(e7.message, "42P01"), "sqlstate 42P01")
+    check(c.TxStatus == 73, "idle after error (not in tx)")
+    // Connection still usable after error.
+    res4, e8 := pg_conn.Query(&c, "SELECT 1", []dbx_value.Value{})
+    expectErr(e8, "post-error query")
+    check(len(res4.Data) == 1, "post-error row")
+
+    pg_conn.Close(&c)
+    if failures > 0 {
+        println("live test:", failures, "failures")
+        return 1
+    }
+    println("live test: all checks passed")
+    return 0
+}

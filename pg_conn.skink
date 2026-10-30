@@ -1,0 +1,774 @@
+// File:    pg_conn.skink
+// Purpose: PostgreSQL connection: startup packet, authentication
+//          negotiation (cleartext, MD5, SCRAM-SHA-256 via dbx_scram),
+//          SSLRequest/TLS upgrade, simple + extended query protocols,
+//          and transaction state tracking.
+//
+//          Queries always use text result format (Bind result formats
+//          = 0) so pg_type.Decode sees uniform text rows. Parameters
+//          use $1..$N placeholders; RewritePlaceholders translates '?'
+//          into $N for callers using the dbx convention.
+module pg_conn
+
+import "std/str"
+import "std/libc"
+import "std/errors"
+import "std/base64"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "mod/markoxley/skink-dbx/dbx_scram"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "pg_msg"
+import "pg_type"
+
+// MD5 from libcrypto — binary-safe (explicit length), unlike the
+// std/crypto convenience wrappers which measure with strlen.
+extern fn MD5(d: string, n: int64, md: string) -> string
+
+// hexChars for md5Hex.
+const hexChars = "0123456789abcdef"
+
+// md5Hex returns the lowercase hex MD5 digest of data[0..n).
+fn md5Hex(data: string, n: int) -> string {
+    raw := libc.malloc(16)
+    MD5(data, int64(n), raw)
+    out := libc.malloc(33)
+    for i := 0; i < 16; i = i + 1 {
+        out[i * 2] = hexChars[raw[i] >> 4]
+        out[i * 2 + 1] = hexChars[raw[i] & 15]
+    }
+    out[32] = 0
+    libc.free(raw)
+    return out
+}
+
+// PgConn is one physical connection to a PostgreSQL server.
+pub struct PgConn {
+    Bc:            dbx_bufconn.BufConn
+    Pid:           int    // backend process id (BackendKeyData)
+    Secret:        int    // cancel key
+    TxStatus:      int    // last ReadyForQuery byte: 'I', 'T', or 'E'
+    ServerVersion: string // ParameterStatus server_version, if sent
+}
+
+// FieldDesc describes one result column from RowDescription.
+pub struct FieldDesc {
+    Name:    string
+    TypeOID: int
+    Format:  int // 0 = text, 1 = binary
+}
+
+// ---- error parsing ----------------------------------------------------
+
+// parseError turns an ErrorResponse/NoticeResponse body into text like
+// "pg: ERROR 42601: syntax error". Field codes: S severity (or V),
+// C sqlstate, M message.
+pub fn ParseError(m: pg_msg.Msg) -> string {
+    c := pg_msg.NewCursor(m.Body, m.BodyLen)
+    sev := ""
+    code := ""
+    msg := ""
+    for pg_msg.Remaining(&c) > 0 {
+        f := pg_msg.CByte(&c)
+        if f <= 0 {
+            break
+        }
+        v := pg_msg.CCStr(&c)
+        if f == 83 || f == 86 { // 'S' or 'V'
+            sev = v
+        } else if f == 67 { // 'C'
+            code = v
+        } else if f == 77 { // 'M'
+            msg = v
+        }
+    }
+    if str.Len(msg) == 0 {
+        return "pg: unknown error"
+    }
+    if str.Len(code) > 0 {
+        return str.Concat("pg: ", str.Concat(sev, str.Concat(" ", str.Concat(code, str.Concat(": ", msg)))))
+    }
+    return str.Concat("pg: ", str.Concat(sev, str.Concat(" ", msg)))
+}
+
+// ---- connect & auth ---------------------------------------------------
+
+// sslRequest performs the SSL negotiation round-trip. require fails
+// the connect when the server refuses TLS; verify enables certificate
+// chain + hostname verification (sslmode=verify-ca/verify-full).
+fn sslRequest(c: *dbx_bufconn.BufConn, require: bool, verify: bool) -> errors.Error {
+    b := pg_msg.NewOutBuf(4)
+    pg_msg.I32(&b, pg_msg.SSL_REQUEST_CODE)
+    body, n := pg_msg.Data(&b)
+    err := pg_msg.SendUntyped(c, body, n)
+    pg_msg.Free(&b)
+    if str.Len(err.message) > 0 {
+        return err
+    }
+    r, rerr := c.ReadByte()
+    if str.Len(rerr.message) > 0 {
+        return rerr
+    }
+    if r == 83 { // 'S'
+        return c.StartTLS(verify)
+    }
+    if require {
+        return errors.New("pg: server does not support SSL (sslmode=require)")
+    }
+    return errors.New("") // 'N' — proceed plaintext
+}
+
+// authSASL runs the SCRAM-SHA-256 exchange once the server has
+// advertised it via AuthenticationSASL ('R' subtype 10).
+fn authSASL(c: *dbx_bufconn.BufConn, user: string, password: string, mechMsg: pg_msg.Msg) -> errors.Error {
+    // Mechanism list: sequence of NUL-terminated names following the
+    // 4-byte auth subtype (10).
+    cur := pg_msg.NewCursor(mechMsg.Body, mechMsg.BodyLen)
+    cur.Pos = 4
+    hasSha256 := false
+    for pg_msg.Remaining(&cur) > 0 {
+        m := pg_msg.CCStr(&cur)
+        if str.Equal(m, dbx_scram.MECH_SHA256) {
+            hasSha256 = true
+        }
+    }
+    if !hasSha256 {
+        return errors.New("pg: server offers no SCRAM-SHA-256 mechanism")
+    }
+    s := dbx_scram.NewScram(user, password, true)
+    first := dbx_scram.ClientFirst(&s)
+
+    // SASLInitialResponse: mechanism\0, int32 len, initial response.
+    b := pg_msg.NewOutBuf(str.Len(first) + str.Len(dbx_scram.MECH_SHA256) + 6)
+    pg_msg.CStr(&b, dbx_scram.MECH_SHA256)
+    pg_msg.I32(&b, str.Len(first))
+    pg_msg.WriteN(&b, first, str.Len(first))
+    body, n := pg_msg.Data(&b)
+    serr := pg_msg.SendMsg(c, 112, body, n) // 'p'
+    pg_msg.Free(&b)
+    if str.Len(serr.message) > 0 {
+        return serr
+    }
+
+    // Expect 'R' 11 (SASLContinue) → server-first; send client-final.
+    for {
+        m, err := pg_msg.ReadMsg(c)
+        if str.Len(err.message) > 0 {
+            return err
+        }
+        if m.Type == 69 { // 'E'
+            return errors.New(ParseError(m))
+        }
+        if m.Type != 82 {
+            return errors.New("pg: unexpected message during SASL auth")
+        }
+        if m.BodyLen < 4 {
+            return errors.New("pg: truncated SASL message")
+        }
+        sub := pg_msg.ReadI32(m.Body, 0)
+        // The SASL payload follows the 4-byte auth subtype. str.Substr
+        // clamps by strlen — the subtype's leading NUL byte would make
+        // it return "" — so slice by pointer arithmetic.
+        payload := ""
+        if m.BodyLen > 4 {
+            payload = libc.malloc(m.BodyLen - 3)
+            libc.memcpy(payload, string(int64(m.Body) + int64(4)), m.BodyLen - 4)
+            payload[m.BodyLen - 4] = 0
+        }
+        if sub == 11 {
+            final, ferr := dbx_scram.HandleServerFirst(&s, payload)
+            if str.Len(ferr.message) > 0 {
+                return ferr
+            }
+            serr2 := pg_msg.SendMsg(c, 112, final, str.Len(final))
+            if str.Len(serr2.message) > 0 {
+                return serr2
+            }
+        } else if sub == 12 {
+            return dbx_scram.VerifyServerFinal(&s, payload)
+        } else if sub == 0 {
+            return errors.New("") // AuthOk before SASLFinal (unusual)
+        } else {
+            return errors.New("pg: unexpected SASL auth sub-message")
+        }
+    }
+    return errors.New("")
+}
+
+// Connect performs TCP dial, optional TLS upgrade, startup, and the
+// full authentication exchange. Returns a ready PgConn.
+pub fn Connect(info: dbx_dsn.ConnInfo) -> (PgConn, errors.Error) {
+    host := info.Host
+    if str.Len(host) == 0 {
+        host = "localhost"
+    }
+    port := dbx_dsn.PortOr(info, 5432)
+    timeoutMs := 10000
+    tp, tok := dbx_dsn.Param(info, "connect_timeout")
+    if tok {
+        tms := 0
+        bad := false
+        for i := 0; i < str.Len(tp); i = i + 1 {
+            ch := tp[i]
+            if ch < 48 || ch > 57 {
+                bad = true
+                break
+            }
+            tms = tms * 10 + (ch - 48)
+        }
+        if !bad && tms > 0 {
+            timeoutMs = tms * 1000
+        }
+    }
+    bc, derr := dbx_bufconn.Dial(host, port, timeoutMs)
+    if str.Len(derr.message) > 0 {
+        return PgConn{}, derr
+    }
+
+    // TLS: sslmode=require forces it; sslmode=prefer tries then falls
+    // back; verify-ca/verify-full additionally validate the server cert;
+    // sslmode=disable (default) stays plaintext.
+    sslmode := dbx_dsn.ParamOr(info, "sslmode", "disable")
+    wantTLS := str.Equal(sslmode, "require") || str.Equal(sslmode, "prefer") ||
+        str.Equal(sslmode, "verify-ca") || str.Equal(sslmode, "verify-full")
+    wantVerify := str.Equal(sslmode, "verify-ca") || str.Equal(sslmode, "verify-full")
+    if !wantTLS && !str.Equal(sslmode, "disable") && !str.Equal(sslmode, "allow") {
+        bc.Close()
+        return PgConn{}, errors.New(str.Concat("pg: unknown sslmode ", sslmode))
+    }
+    if wantTLS {
+        serr := sslRequest(&bc, !str.Equal(sslmode, "prefer"), wantVerify)
+        if str.Len(serr.message) > 0 {
+            bc.Close()
+            return PgConn{}, serr
+        }
+    }
+
+    // StartupMessage: protocol, user, database, optional params.
+    db := info.Database
+    if str.Len(db) == 0 {
+        db = info.User
+    }
+    sb := pg_msg.NewOutBuf(64)
+    pg_msg.I32(&sb, pg_msg.PROTOCOL_V3)
+    pg_msg.CStr(&sb, "user")
+    pg_msg.CStr(&sb, info.User)
+    pg_msg.CStr(&sb, "database")
+    pg_msg.CStr(&sb, db)
+    app := dbx_dsn.ParamOr(info, "application_name", "")
+    if str.Len(app) > 0 {
+        pg_msg.CStr(&sb, "application_name")
+        pg_msg.CStr(&sb, app)
+    }
+    pg_msg.CStr(&sb, "client_encoding")
+    pg_msg.CStr(&sb, "UTF8")
+    pg_msg.Byte(&sb, 0)
+    sbody, sn := pg_msg.Data(&sb)
+    stErr := pg_msg.SendUntyped(&bc, sbody, sn)
+    pg_msg.Free(&sb)
+    if str.Len(stErr.message) > 0 {
+        bc.Close()
+        return PgConn{}, stErr
+    }
+
+    conn := PgConn{Bc: bc, TxStatus: 73} // 'I'
+
+    // Auth negotiation loop until ReadyForQuery.
+    for {
+        m, rerr := pg_msg.ReadMsg(&conn.Bc)
+        if str.Len(rerr.message) > 0 {
+            conn.Bc.Close()
+            return PgConn{}, rerr
+        }
+        if m.Type == 82 { // 'R' Authentication*
+            if m.BodyLen < 4 {
+                conn.Bc.Close()
+                return PgConn{}, errors.New("pg: truncated auth request")
+            }
+            sub := pg_msg.ReadI32(m.Body, 0)
+            if sub == 0 {
+                // AuthenticationOk — keep reading until 'Z'.
+            } else if sub == 3 {
+                // cleartext
+                pb := pg_msg.NewOutBuf(str.Len(info.Password) + 1)
+                pg_msg.CStr(&pb, info.Password)
+                pbody, pn := pg_msg.Data(&pb)
+                perr := pg_msg.SendMsg(&conn.Bc, 112, pbody, pn)
+                pg_msg.Free(&pb)
+                if str.Len(perr.message) > 0 {
+                    conn.Bc.Close()
+                    return PgConn{}, perr
+                }
+            } else if sub == 5 {
+                // MD5: password → md5(pw+user) hex → md5(hex+salt) hex
+                if m.BodyLen < 8 {
+                    conn.Bc.Close()
+                    return PgConn{}, errors.New("pg: truncated MD5 auth request")
+                }
+                inner := md5Hex(str.Concat(info.Password, info.User),
+                    str.Len(info.Password) + str.Len(info.User))
+                salted := libc.malloc(36)
+                libc.memcpy(salted, inner, 32)
+                libc.memcpy(string(int64(salted) + int64(32)),
+                    string(int64(m.Body) + int64(4)), 4)
+                outer := md5Hex(salted, 36)
+                libc.free(salted)
+                pb := pg_msg.NewOutBuf(36)
+                pg_msg.CStr(&pb, str.Concat("md5", outer))
+                pbody, pn := pg_msg.Data(&pb)
+                perr := pg_msg.SendMsg(&conn.Bc, 112, pbody, pn)
+                pg_msg.Free(&pb)
+                if str.Len(perr.message) > 0 {
+                    conn.Bc.Close()
+                    return PgConn{}, perr
+                }
+            } else if sub == 10 {
+                aerr := authSASL(&conn.Bc, info.User, info.Password, m)
+                if str.Len(aerr.message) > 0 {
+                    conn.Bc.Close()
+                    return PgConn{}, aerr
+                }
+            } else {
+                conn.Bc.Close()
+                return PgConn{}, errors.New("pg: unsupported auth request")
+            }
+        } else if m.Type == 83 { // 'S' ParameterStatus
+            c := pg_msg.NewCursor(m.Body, m.BodyLen)
+            name := pg_msg.CCStr(&c)
+            val := pg_msg.CCStr(&c)
+            if str.Equal(name, "server_version") {
+                conn.ServerVersion = val
+            }
+        } else if m.Type == 75 { // 'K' BackendKeyData
+            conn.Pid = pg_msg.ReadI32(m.Body, 0)
+            conn.Secret = pg_msg.ReadI32(m.Body, 4)
+        } else if m.Type == 69 { // 'E' ErrorResponse
+            emsg := ParseError(m)
+            conn.Bc.Close()
+            return PgConn{}, errors.New(emsg)
+        } else if m.Type == 90 { // 'Z' ReadyForQuery
+            if m.BodyLen > 0 {
+                conn.TxStatus = m.Body[0]
+            }
+            return conn, errors.New("")
+        }
+        // 'N' notices and anything else: ignore.
+    }
+    return PgConn{}, errors.New("")
+}
+
+// Close sends Terminate and releases the socket.
+pub fn Close(c: *PgConn) -> errors.Error {
+    pg_msg.SendMsg(&c.Bc, 88, "", 0) // 'X' — best effort
+    c.Bc.Close()
+    return errors.New("")
+}
+
+// ---- placeholder rewriting ---------------------------------------------
+
+// RewritePlaceholders translates '?' bind markers into $1..$N, skipping
+// quoted literals, identifiers, dollar-quoted bodies, and comments.
+// Numbering starts above the largest $N already present so mixed
+// styles cannot collide.
+pub fn RewritePlaceholders(sql: string) -> string {
+    out := pg_msg.NewOutBuf(str.Len(sql) + 8)
+    n := str.Len(sql)
+    // Pre-scan for existing $N markers to find the next free index.
+    idx := 1
+    i := 0
+    for i < n {
+        if sql[i] == 36 && i + 1 < n && sql[i + 1] >= 48 && sql[i + 1] <= 57 {
+            v := 0
+            j := i + 1
+            for j < n && sql[j] >= 48 && sql[j] <= 57 {
+                v = v * 10 + (sql[j] - 48)
+                j = j + 1
+            }
+            if v >= idx {
+                idx = v + 1
+            }
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    i = 0
+    for i < n {
+        c := sql[i]
+        if c == 39 { // '...' literal — opening quote then scan to close
+            pg_msg.Byte(&out, c)
+            i = i + 1
+            for i < n {
+                pg_msg.Byte(&out, sql[i])
+                if sql[i] == 39 {
+                    if i + 1 < n && sql[i + 1] == 39 {
+                        i = i + 1
+                        pg_msg.Byte(&out, sql[i])
+                        i = i + 1
+                        continue
+                    }
+                    i = i + 1
+                    break
+                }
+                i = i + 1
+            }
+        } else if c == 34 { // "..."
+            for i < n {
+                pg_msg.Byte(&out, sql[i])
+                if sql[i] == 34 {
+                    i = i + 1
+                    break
+                }
+                i = i + 1
+            }
+        } else if c == 45 && i + 1 < n && sql[i + 1] == 45 { // -- comment
+            for i < n && sql[i] != 10 {
+                pg_msg.Byte(&out, sql[i])
+                i = i + 1
+            }
+        } else if c == 47 && i + 1 < n && sql[i + 1] == 42 { // /* */
+            pg_msg.Byte(&out, c)
+            pg_msg.Byte(&out, 42)
+            i = i + 2
+            for i + 1 < n && !(sql[i] == 42 && sql[i + 1] == 47) {
+                pg_msg.Byte(&out, sql[i])
+                i = i + 1
+            }
+            if i + 1 < n {
+                pg_msg.Byte(&out, 42)
+                pg_msg.Byte(&out, 47)
+                i = i + 2
+            }
+        } else if c == 63 { // '?'
+            pg_msg.Byte(&out, 36) // '$'
+            num := strconvItoa(idx)
+            pg_msg.WriteN(&out, num, str.Len(num))
+            idx = idx + 1
+            i = i + 1
+        } else if c == 36 { // '$...' — dollar-quoted body or $N param
+            // A '$' starting a $tag$ dollar quote opens a literal body
+            // that runs to the matching $tag$; a bare $N is a numbered
+            // placeholder and passes through untouched.
+            j := i + 1
+            for j < n && (sql[j] == 95 ||
+                    (sql[j] >= 48 && sql[j] <= 57) ||
+                    (sql[j] >= 65 && sql[j] <= 90) ||
+                    (sql[j] >= 97 && sql[j] <= 122)) {
+                j = j + 1
+            }
+            // j == i+1 means an empty tag ("$$") — still a valid quote.
+            if j < n && sql[j] == 36 { // opening $tag$
+                tag := str.Substr(sql, i, j - i + 1)
+                // emit through the matching closing $tag$
+                k := j + 1
+                closed := false
+                for k + str.Len(tag) <= n {
+                    hit := true
+                    for q := 0; q < str.Len(tag); q = q + 1 {
+                        if sql[k + q] != tag[q] {
+                            hit = false
+                            break
+                        }
+                    }
+                    if hit {
+                        k = k + str.Len(tag)
+                        closed = true
+                        break
+                    }
+                    k = k + 1
+                }
+                if closed {
+                    pg_msg.WriteN(&out, str.Substr(sql, i, k - i), k - i)
+                    i = k
+                    continue
+                }
+            }
+            pg_msg.Byte(&out, c)
+            i = i + 1
+        } else {
+            pg_msg.Byte(&out, c)
+            i = i + 1
+        }
+    }
+    s, ln := pg_msg.Data(&out)
+    copy := libc.malloc(ln + 1)
+    libc.memcpy(copy, s, ln + 1)
+    pg_msg.Free(&out)
+    return copy
+}
+
+// strconvItoa is a minimal decimal formatter for placeholder numbers
+// (avoids importing strconv for one call).
+fn strconvItoa(v: int) -> string {
+    if v == 0 {
+        return "0"
+    }
+    buf := libc.malloc(12)
+    n := v
+    i := 11
+    buf[i] = 0
+    for n > 0 {
+        i = i - 1
+        buf[i] = 48 + (n % 10)
+        n = n / 10
+    }
+    return string(int64(buf) + int64(i))
+}
+
+// ---- query engine ------------------------------------------------------
+
+// tagAffected parses the row count from a CommandComplete tag
+// ("SELECT 3", "UPDATE 5", "INSERT 0 1"). Returns 0 for tags without
+// a count ("BEGIN", "CREATE TABLE").
+pub fn TagAffected(tag: string) -> int64 {
+    n := str.Len(tag)
+    // find last space
+    sp := -1
+    for i := 0; i < n; i = i + 1 {
+        if tag[i] == 32 {
+            sp = i
+        }
+    }
+    if sp < 0 {
+        return int64(0)
+    }
+    v := int64(0)
+    any := false
+    for i := sp + 1; i < n; i = i + 1 {
+        c := tag[i]
+        if c < 48 || c > 57 {
+            return int64(0)
+        }
+        v = v * int64(10) + int64(c - 48)
+        any = true
+    }
+    if !any {
+        return int64(0)
+    }
+    return v
+}
+
+// parseRowDescription decodes a 'T' body into field descriptors.
+fn parseRowDescription(m: pg_msg.Msg) -> []FieldDesc {
+    c := pg_msg.NewCursor(m.Body, m.BodyLen)
+    nf := pg_msg.CI16(&c)
+    var fields []FieldDesc
+    for i := 0; i < nf; i = i + 1 {
+        name := pg_msg.CCStr(&c)
+        pg_msg.CI32(&c) // table oid
+        pg_msg.CI16(&c) // column attnum
+        toid := pg_msg.CI32(&c)
+        pg_msg.CI16(&c) // typlen
+        pg_msg.CI32(&c) // typmod
+        fmt := pg_msg.CI16(&c)
+        fields = append(fields, FieldDesc{Name: name, TypeOID: toid, Format: fmt})
+    }
+    return fields
+}
+
+// parseDataRow decodes a 'D' body against the field list.
+fn parseDataRow(m: pg_msg.Msg, fields: []FieldDesc) -> []dbx_value.Value {
+    c := pg_msg.NewCursor(m.Body, m.BodyLen)
+    nc := pg_msg.CI16(&c)
+    var row []dbx_value.Value
+    for i := 0; i < nc; i = i + 1 {
+        ln := pg_msg.CI32(&c)
+        if ln < 0 {
+            row = append(row, dbx_value.Null())
+        } else {
+            data, got := pg_msg.CBytes(&c, ln)
+            oid := 0
+            fmt := 0
+            if i < len(fields) {
+                oid = fields[i].TypeOID
+                fmt = fields[i].Format
+            }
+            if fmt == 0 {
+                row = append(row, pg_type.Decode(oid, data, got))
+            } else {
+                row = append(row, dbx_value.Blob(data, got))
+            }
+        }
+    }
+    return row
+}
+
+// QueryResult bundles what a query produced.
+pub struct QueryResult {
+    Columns:  []string
+    Fields:   []FieldDesc
+    Data:     [][]dbx_value.Value
+    Tag:      string
+    Affected: int64
+}
+
+// drainUntilReady reads messages until ReadyForQuery, updating TxStatus
+// and collecting the first error seen. Rows/columns arrive through the
+// per-message switch in the callers instead — this helper is for the
+// extended-protocol tail after '1'/'2' bookkeeping.
+fn drainUntilReady(c: *PgConn, res: *QueryResult, firstErr: *errors.Error) {
+    var fields []FieldDesc
+    for {
+        m, err := pg_msg.ReadMsg(&c.Bc)
+        if str.Len(err.message) > 0 {
+            if str.Len(firstErr.message) == 0 {
+                *firstErr = err
+            }
+            return
+        }
+        if m.Type == 90 { // 'Z'
+            if m.BodyLen > 0 {
+                c.TxStatus = m.Body[0]
+            }
+            return
+        }
+        if m.Type == 84 { // 'T'
+            fields = parseRowDescription(m)
+            var cols []string
+            for i := 0; i < len(fields); i = i + 1 {
+                cols = append(cols, fields[i].Name)
+            }
+            res.Columns = cols
+            res.Fields = fields
+        } else if m.Type == 68 { // 'D'
+            res.Data = append(res.Data, parseDataRow(m, fields))
+        } else if m.Type == 67 { // 'C'
+            c2 := pg_msg.NewCursor(m.Body, m.BodyLen)
+            res.Tag = pg_msg.CCStr(&c2)
+            res.Affected = TagAffected(res.Tag)
+        } else if m.Type == 69 { // 'E'
+            if str.Len(firstErr.message) == 0 {
+                *firstErr = errors.New(ParseError(m))
+            }
+        }
+        // '1','2','3','n','t','s','I','N','A': bookkeeping/notices — skip.
+    }
+}
+
+// SimpleQuery runs the 'Q' protocol: sql is sent verbatim (multiple
+// statements allowed; only the last result set is kept). Parameters are
+// not supported — use Query for that.
+pub fn SimpleQuery(c: *PgConn, sql: string) -> (QueryResult, errors.Error) {
+    b := pg_msg.NewOutBuf(str.Len(sql) + 1)
+    pg_msg.CStr(&b, sql)
+    body, n := pg_msg.Data(&b)
+    serr := pg_msg.SendMsg(&c.Bc, 81, body, n) // 'Q'
+    pg_msg.Free(&b)
+    res := QueryResult{}
+    if str.Len(serr.message) > 0 {
+        return res, serr
+    }
+    ferr := errors.New("")
+    drainUntilReady(c, &res, &ferr)
+    if str.Len(ferr.message) > 0 {
+        return res, ferr
+    }
+    return res, errors.New("")
+}
+
+// Query runs one parameterized statement via the extended protocol
+// (Parse/Bind/Describe/Execute/Sync on unnamed statement+portal). The
+// sql uses $1..$N placeholders — call RewritePlaceholders first for
+// '?'-style SQL.
+pub fn Query(c: *PgConn, sql: string, args: []dbx_value.Value) -> (QueryResult, errors.Error) {
+    res := QueryResult{}
+    buf := pg_msg.NewOutBuf(str.Len(sql) + 64)
+
+    // Parse: stmt\0 sql\0 int16 0 (param types inferred server-side).
+    pg_msg.CStr(&buf, "")
+    pg_msg.CStr(&buf, sql)
+    pg_msg.I16(&buf, 0)
+    body, n := pg_msg.Data(&buf)
+    err := pg_msg.SendMsg(&c.Bc, 80, body, n) // 'P'
+    if str.Len(err.message) > 0 {
+        pg_msg.Free(&buf)
+        return res, err
+    }
+
+    // Bind: portal\0 stmt\0 nfmt=0, nparams, [len bytes]..., nresfmt=0.
+    pg_msg.Free(&buf)
+    buf = pg_msg.NewOutBuf(64)
+    pg_msg.CStr(&buf, "")
+    pg_msg.CStr(&buf, "")
+    pg_msg.I16(&buf, 0)
+    pg_msg.I16(&buf, len(args))
+    for i := 0; i < len(args); i = i + 1 {
+        data, dn, isNull := pg_type.Encode(args[i])
+        if isNull {
+            pg_msg.I32(&buf, -1)
+        } else {
+            pg_msg.I32(&buf, dn)
+            pg_msg.WriteN(&buf, data, dn)
+        }
+    }
+    pg_msg.I16(&buf, 0)
+    body, n = pg_msg.Data(&buf)
+    err = pg_msg.SendMsg(&c.Bc, 66, body, n) // 'B'
+    if str.Len(err.message) > 0 {
+        pg_msg.Free(&buf)
+        return res, err
+    }
+    pg_msg.Free(&buf)
+
+    // Describe portal 'D' + Execute 'E' + Sync 'S'.
+    buf = pg_msg.NewOutBuf(8)
+    pg_msg.Byte(&buf, 80) // 'P' = portal
+    pg_msg.CStr(&buf, "")
+    body, n = pg_msg.Data(&buf)
+    err = pg_msg.SendMsg(&c.Bc, 68, body, n) // 'D'
+    pg_msg.Free(&buf)
+    if str.Len(err.message) > 0 {
+        return res, err
+    }
+    buf = pg_msg.NewOutBuf(8)
+    pg_msg.CStr(&buf, "")
+    pg_msg.I32(&buf, 0)
+    body, n = pg_msg.Data(&buf)
+    err = pg_msg.SendMsg(&c.Bc, 69, body, n) // 'E'
+    pg_msg.Free(&buf)
+    if str.Len(err.message) > 0 {
+        return res, err
+    }
+    err = pg_msg.SendMsg(&c.Bc, 83, "", 0) // 'S' Sync
+    if str.Len(err.message) > 0 {
+        return res, err
+    }
+
+    ferr := errors.New("")
+    drainUntilReady(c, &res, &ferr)
+    if str.Len(ferr.message) > 0 {
+        return res, ferr
+    }
+    return res, errors.New("")
+}
+
+// Ping verifies the connection with a trivial query.
+pub fn Ping(c: *PgConn) -> errors.Error {
+    _, err := SimpleQuery(c, "SELECT 1")
+    return err
+}
+
+// exec runs sql with args and reports only affected count.
+pub fn Exec(c: *PgConn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    res, err := Query(c, sql, args)
+    if str.Len(err.message) > 0 {
+        return int64(0), err
+    }
+    return res.Affected, errors.New("")
+}
+
+// Begin/CommitTx/RollbackTx manage the transaction lifecycle.
+pub fn Begin(c: *PgConn) -> errors.Error {
+    _, err := SimpleQuery(c, "BEGIN")
+    return err
+}
+
+pub fn CommitTx(c: *PgConn) -> errors.Error {
+    _, err := SimpleQuery(c, "COMMIT")
+    return err
+}
+
+pub fn RollbackTx(c: *PgConn) -> errors.Error {
+    _, err := SimpleQuery(c, "ROLLBACK")
+    return err
+}

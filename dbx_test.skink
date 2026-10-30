@@ -1,0 +1,108 @@
+// File:    dbx_test.skink
+// Purpose: Tests for the pg_dbx adapter — driver registration,
+//          dbx.Open dispatch, '?' → $N placeholder rewriting across
+//          the wire, and transaction mapping to BEGIN/COMMIT.
+module dbx_test
+
+import "pg_msg"
+import "pg_type"
+import "pg_dbx"
+import "testkit"
+import "mod/markoxley/skink-dbx/dbx_driver"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/strconv"
+import "std/testing"
+import "std/waitgroup"
+import "std/errors"
+
+// lastParseSql captures the rewritten SQL text from Parse messages.
+var lastParseSql string
+// lastParams captures Bind parameter text.
+var lastParams []string
+
+// dbxHandler drives a full extended-query exchange: it must answer
+// P, B, D, E, S — five handler invocations per Query.
+fn dbxHandler(req: testkit.FakeReq) -> []pg_msg.Msg {
+    if req.Kind == testkit.ReqParse {
+        lastParseSql = req.Sql
+        return []pg_msg.Msg{testkit.ParseOK()}
+    }
+    if req.Kind == testkit.ReqBind {
+        lastParams = req.Params
+        return []pg_msg.Msg{testkit.BindOK()}
+    }
+    if req.MsgType == 68 { // 'D' Describe portal
+        return []pg_msg.Msg{
+            testkit.DescMsg([]string{"cnt"}, []int{pg_type.OID_INT8}),
+        }
+    }
+    if req.MsgType == 69 { // 'E' Execute
+        return []pg_msg.Msg{
+            testkit.RowMsg([]string{"99"}),
+            testkit.CompleteMsg("SELECT 1"),
+        }
+    }
+    if req.MsgType == 83 { // 'S' Sync
+        return []pg_msg.Msg{testkit.Ready()}
+    }
+    return []pg_msg.Msg{}
+}
+
+// TestOpenQuery runs dbx.Open → Conn.Query through the fake backend.
+pub fn TestOpenQuery() {
+    lastParseSql = ""
+    lastParams = []string{}
+    fs, wg, _ := testkit.StartFakeServer(15511)
+    spawn testkit.Serve(&fs, 5, dbxHandler, wg)
+
+    pg_dbx.Register()
+    conn, err := dbx_driver.Open(str.Concat("postgres://u@127.0.0.1:",
+        str.Concat(strconv.Itoa(fs.Port), "/db")))
+    testing.AssertTrue(str.Len(err.message) == 0, str.Concat("open: ", err.message))
+    testing.AssertEqualString("postgres", conn.Name, "driver name")
+
+    rows, qerr := conn.Query("SELECT count(*) FROM t WHERE id = ?",
+        []dbx_value.Value{dbx_value.Int(int64(5))})
+    testing.AssertTrue(str.Len(qerr.message) == 0, str.Concat("query: ", qerr.message))
+    testing.AssertTrue(rows.Next(), "has row")
+    testing.AssertTrue(rows.Int64("cnt") == int64(99), "cnt value")
+    // '?' rewrote to $1 before Parse.
+    testing.AssertEqualString("SELECT count(*) FROM t WHERE id = $1", lastParseSql, "rewritten sql")
+    testing.AssertEqualString("5", lastParams[0], "param text")
+    conn.Close()
+    waitgroup.Wait(wg)
+}
+
+// txScriptedHandler answers 'Q' BEGIN/COMMIT — dbx Begin/Commit use
+// SimpleQuery internally.
+fn txScriptedHandler(req: testkit.FakeReq) -> []pg_msg.Msg {
+    if req.Kind == testkit.ReqSimple {
+        if str.Equal(str.Trim(req.Sql), "BEGIN") {
+            return []pg_msg.Msg{testkit.CompleteMsg("BEGIN"), testkit.ReadyTx(84)}
+        }
+        return []pg_msg.Msg{testkit.CompleteMsg("COMMIT"), testkit.Ready()}
+    }
+    return []pg_msg.Msg{}
+}
+
+// TestTxMapping covers dbx Tx → BEGIN/COMMIT on the wire.
+pub fn TestTxMapping() {
+    fs, wg, _ := testkit.StartFakeServer(15512)
+    spawn testkit.Serve(&fs, 2, txScriptedHandler, wg)
+
+    pg_dbx.Register()
+    conn, err := dbx_driver.Open(str.Concat("postgres://u@127.0.0.1:",
+        str.Concat(strconv.Itoa(fs.Port), "/db")))
+    testing.AssertTrue(str.Len(err.message) == 0, "open")
+    tx, terr := conn.Begin()
+    testing.AssertTrue(str.Len(terr.message) == 0, "begin")
+    testing.AssertTrue(conn.InTx, "InTx flag")
+    cerr := tx.Commit()
+    testing.AssertTrue(str.Len(cerr.message) == 0, "commit")
+    // Double-commit is a dbx-side error.
+    derr := tx.Commit()
+    testing.AssertTrue(str.Len(derr.message) > 0, "double commit rejected")
+    conn.Close()
+    waitgroup.Wait(wg)
+}

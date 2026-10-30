@@ -1,0 +1,417 @@
+// File:    pg_type.skink
+// Purpose: PostgreSQL type system bridge. Decodes text-format column
+//          values (this driver always requests result format 0) into
+//          dbx_value.Value by type OID, and encodes dbx_value.Value
+//          parameters into text-format bytes for Bind.
+//
+//          Time/date OIDs decode to KIND_TIME (Unix microseconds) via
+//          a civil-date algorithm; numeric/decimal stays KIND_TEXT so
+//          no precision is lost; unknown OIDs fall back to KIND_TEXT
+//          preserving the raw bytes.
+module pg_type
+
+import "std/str"
+import "std/libc"
+import "std/errors"
+import "std/strconv"
+import "std/fmt"
+import "mod/markoxley/skink-dbx/dbx_value"
+
+// Common PostgreSQL type OIDs (pg_type catalog).
+pub const OID_BOOL        = 16
+pub const OID_BYTEA       = 17
+pub const OID_INT8        = 20
+pub const OID_INT2        = 21
+pub const OID_INT4        = 23
+pub const OID_TEXT        = 25
+pub const OID_OID         = 26
+pub const OID_FLOAT4      = 700
+pub const OID_FLOAT8      = 701
+pub const OID_VARCHAR     = 1043
+pub const OID_DATE        = 1082
+pub const OID_TIME        = 1083
+pub const OID_TIMESTAMP   = 1114
+pub const OID_TIMESTAMPTZ = 1184
+pub const OID_NUMERIC     = 1700
+pub const OID_UUID        = 2950
+pub const OID_JSON        = 114
+pub const OID_JSONB       = 3802
+
+// daysFromCivil converts a y/m/d Gregorian date to days since
+// 1970-01-01 (Howard Hinnant's algorithm).
+pub fn daysFromCivil(y: int, m: int, d: int) -> int64 {
+    yy := int64(y)
+    if m <= 2 {
+        yy = yy - 1
+    }
+    era := yy / 400
+    if yy < 0 && yy % 400 != 0 {
+        era = era - 1
+    }
+    yoe := yy - era * 400
+    mm := m
+    if m > 2 {
+        mm = m - 3
+    } else {
+        mm = m + 9
+    }
+    doy := (153 * int64(mm) + 2) / 5 + int64(d) - 1
+    doe := yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+// digits reads up to `n` decimal digits starting at *pos, returning the
+// value. Stops early on any non-digit.
+fn digits(s: string, pos: *int, n: int) -> int {
+    v := 0
+    for i := 0; i < n; i = i + 1 {
+        c := s[*pos]
+        if c < 48 || c > 57 {
+            break
+        }
+        v = v * 10 + (c - 48)
+        *pos = *pos + 1
+    }
+    return v
+}
+
+// parseTimestampMicros decodes "YYYY-MM-DD[ HH:MM:SS[.ffffff]][+TZ]"
+// text (date/timestamp/timestamptz formats) into Unix microseconds.
+// Timezone offsets are applied; a trailing 'Z'/'BC' is tolerated.
+// Returns false on malformed input.
+pub fn ParseTimestampMicros(s: string) -> (int64, bool) {
+    n := str.Len(s)
+    if n < 10 {
+        return int64(0), false
+    }
+    pos := 0
+    y := digits(s, &pos, 6)
+    if pos >= n || s[pos] != 45 { return int64(0), false } // '-'
+    pos = pos + 1
+    mo := digits(s, &pos, 2)
+    if pos >= n || s[pos] != 45 { return int64(0), false }
+    pos = pos + 1
+    dy := digits(s, &pos, 2)
+    if y == 0 || mo < 1 || mo > 12 || dy < 1 || dy > 31 {
+        return int64(0), false
+    }
+    days := daysFromCivil(y, mo, dy)
+    micros := days * int64(86400) * int64(1000000)
+    if pos >= n {
+        return micros, true // bare date
+    }
+    // Separator between date and time: space or 'T'.
+    sep := s[pos]
+    if sep != 32 && sep != 84 {
+        return int64(0), false
+    }
+    pos = pos + 1
+    hh := digits(s, &pos, 2)
+    if pos >= n || s[pos] != 58 { return int64(0), false }
+    pos = pos + 1
+    mi := digits(s, &pos, 2)
+    if pos >= n || s[pos] != 58 { return int64(0), false }
+    pos = pos + 1
+    ss := digits(s, &pos, 2)
+    micros = micros + int64(hh * 3600 + mi * 60 + ss) * int64(1000000)
+    if pos < n && s[pos] == 46 { // '.ffffff' fraction
+        pos = pos + 1
+        frac := int64(0)
+        scale := int64(100000)
+        for pos < n && scale > 0 {
+            c := s[pos]
+            if c < 48 || c > 57 { break }
+            frac = frac + int64(c - 48) * scale
+            scale = scale / 10
+            pos = pos + 1
+        }
+        // Consume any extra precision digits past 6.
+        for pos < n && s[pos] >= 48 && s[pos] <= 57 {
+            pos = pos + 1
+        }
+        micros = micros + frac
+    }
+    // Optional timezone offset "+HH[:MM]" / "-HH[:MM]" / 'Z'.
+    if pos < n && (s[pos] == 43 || s[pos] == 45) {
+        sign := s[pos]
+        pos = pos + 1
+        th := digits(s, &pos, 2)
+        tm := 0
+        if pos < n && s[pos] == 58 {
+            pos = pos + 1
+            tm = digits(s, &pos, 2)
+        }
+        off := int64(th * 3600 + tm) * int64(1000000)
+        if sign == 43 {
+            micros = micros - off
+        } else {
+            micros = micros + off
+        }
+    }
+    return micros, true
+}
+
+// hexNibble decodes one hex digit, -1 on invalid.
+fn hexNibble(c: int) -> int {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 97 + 10 }
+    if c >= 65 && c <= 70 { return c - 65 + 10 }
+    return -1
+}
+
+// decodeBytea converts text-format bytea ("\x<hex>" or escape form)
+// into raw bytes, returning data + length.
+fn decodeBytea(s: string) -> (string, int) {
+    n := str.Len(s)
+    if n >= 2 && s[0] == 92 && s[1] == 120 { // "\x" hex format
+        out := libc.malloc(n / 2 + 1)
+        j := 0
+        i := 2
+        for i + 1 < n {
+            hi := hexNibble(s[i])
+            lo := hexNibble(s[i + 1])
+            if hi < 0 || lo < 0 {
+                break
+            }
+            out[j] = hi * 16 + lo
+            j = j + 1
+            i = i + 2
+        }
+        out[j] = 0
+        return out, j
+    }
+    // Legacy escape format: \ooo octal, \\ backslash.
+    out := libc.malloc(n + 1)
+    j := 0
+    i := 0
+    for i < n {
+        if s[i] == 92 && i + 1 < n {
+            if s[i + 1] == 92 {
+                out[j] = 92
+                j = j + 1
+                i = i + 2
+            } else if i + 3 < n {
+                out[j] = (s[i + 1] - 48) * 64 + (s[i + 2] - 48) * 8 + (s[i + 3] - 48)
+                j = j + 1
+                i = i + 4
+            } else {
+                i = i + 1
+            }
+        } else {
+            out[j] = s[i]
+            j = j + 1
+            i = i + 1
+        }
+    }
+    out[j] = 0
+    return out, j
+}
+
+// Decode converts a text-format column value of the given type OID into
+// a dbx_value.Value. len=-1 (SQL NULL) is handled by the caller; here a
+// null flag keeps the boundary explicit.
+pub fn Decode(oid: int, data: string, n: int) -> dbx_value.Value {
+    if oid == OID_BOOL {
+        return dbx_value.Bool(n > 0 && (data[0] == 116 || data[0] == 84)) // 't'|'T'
+    }
+    if oid == OID_INT2 || oid == OID_INT4 || oid == OID_INT8 || oid == OID_OID {
+        v, ok := strconv.ParseInt64(data)
+        if ok {
+            return dbx_value.Int(v)
+        }
+        return dbx_value.TextN(data, n)
+    }
+    if oid == OID_FLOAT4 || oid == OID_FLOAT8 {
+        v, ok := strconv.ParseFloat(data)
+        if ok {
+            return dbx_value.Float(v)
+        }
+        return dbx_value.TextN(data, n)
+    }
+    if oid == OID_BYTEA {
+        raw, rn := decodeBytea(data)
+        return dbx_value.Blob(raw, rn)
+    }
+    if oid == OID_DATE || oid == OID_TIME || oid == OID_TIMESTAMP || oid == OID_TIMESTAMPTZ {
+        if oid == OID_TIME {
+            // "HH:MM:SS[.f]" — microseconds since midnight.
+            pos := 0
+            hh := digits(data, &pos, 2)
+            if pos < n && data[pos] == 58 {
+                pos = pos + 1
+                mi := digits(data, &pos, 2)
+                ss := 0
+                frac := int64(0)
+                if pos < n && data[pos] == 58 {
+                    pos = pos + 1
+                    ss = digits(data, &pos, 2)
+                    if pos < n && data[pos] == 46 {
+                        pos = pos + 1
+                        scale := int64(100000)
+                        for pos < n && scale > 0 && data[pos] >= 48 && data[pos] <= 57 {
+                            frac = frac + int64(data[pos] - 48) * scale
+                            scale = scale / 10
+                            pos = pos + 1
+                        }
+                    }
+                }
+                return dbx_value.TimeUnixMicros(int64(hh * 3600 + mi * 60 + ss) * int64(1000000) + frac)
+            }
+            return dbx_value.TextN(data, n)
+        }
+        us, ok := ParseTimestampMicros(data)
+        if ok {
+            return dbx_value.TimeUnixMicros(us)
+        }
+        return dbx_value.TextN(data, n)
+    }
+    // numeric, uuid, json(b), text, varchar and everything else: keep
+    // exact text so precision/structure survives.
+    return dbx_value.TextN(data, n)
+}
+
+// ---- parameter encoding ----------------------------------------------
+
+// hexDigits for bytea escaping.
+const hexDigits = "0123456789abcdef"
+
+// Encode renders a Value as a text-format Bind parameter. Returns the
+// bytes, their length, and whether the value is SQL NULL.
+pub fn Encode(v: dbx_value.Value) -> (string, int, bool) {
+    if dbx_value.IsNull(v) {
+        return "", 0, true
+    }
+    if v.Kind == dbx_value.KIND_INT {
+        s := strconv.Itoa64(v.I64)
+        return s, str.Len(s), false
+    }
+    if v.Kind == dbx_value.KIND_FLOAT {
+        s := encodeFloat(v.F64)
+        return s, str.Len(s), false
+    }
+    if v.Kind == dbx_value.KIND_BOOL {
+        if v.Bool {
+            return "t", 1, false
+        }
+        return "f", 1, false
+    }
+    if v.Kind == dbx_value.KIND_BLOB {
+        // "\x<hex>" bytea literal.
+        src := dbx_value.Bytes(v)
+        out := libc.malloc(v.Len * 2 + 3)
+        out[0] = 92
+        out[1] = 120
+        for i := 0; i < v.Len; i = i + 1 {
+            c := src[i]
+            out[2 + i * 2] = hexDigits[c >> 4]
+            out[3 + i * 2] = hexDigits[c & 15]
+        }
+        n := v.Len * 2 + 2
+        out[n] = 0
+        return out, n, false
+    }
+    // Text / Time / unknown: emit as text. Time formats back to a
+    // timestamp literal so the server can cast it.
+    if v.Kind == dbx_value.KIND_TIME {
+        s := formatMicros(v.I64)
+        return s, str.Len(s), false
+    }
+    return v.Str, v.Len, false
+}
+
+// formatMicros renders Unix microseconds as "YYYY-MM-DD HH:MM:SS.ffffff".
+fn formatMicros(us: int64) -> string {
+    days := us / int64(86400000000)
+    rem := us % int64(86400000000)
+    if rem < 0 {
+        rem = rem + int64(86400000000)
+        days = days - 1
+    }
+    y, mo, dy := civilFromDays(days)
+    secs := rem / int64(1000000)
+    frac := rem % int64(1000000)
+    hh := secs / 3600
+    mi := (secs % 3600) / 60
+    ss := secs % 60
+    return fmt.Sprintf("%s-%s-%s %s:%s:%s.%s", []fmt.Arg{
+        fmt.SArg(pad4(y)), fmt.SArg(pad2(mo)), fmt.SArg(pad2(dy)),
+        fmt.SArg(pad2(int(hh))), fmt.SArg(pad2(int(mi))),
+        fmt.SArg(pad2(int(ss))), fmt.SArg(pad6(int(frac)))})
+}
+
+// encodeFloat renders a float64 as the shortest fixed-notation literal
+// that parses back to the identical value (round-trip). It probes
+// increasing precisions of strconv.FormatFloat, then trims trailing
+// zeros — "%g" via the runtime is only 6 significant digits, which
+// loses precision.
+fn encodeFloat(v: float) -> string {
+    p := 0
+    for p <= 17 {
+        s := strconv.FormatFloat(v, p)
+        pv, ok := strconv.ParseFloat(s)
+        if ok && pv == v {
+            // Trim trailing fraction zeros and a bare point.
+            dot := str.IndexOf(s, ".")
+            if dot >= 0 {
+                e := str.Len(s)
+                for e > dot + 1 && s[e - 1] == 48 {
+                    e = e - 1
+                }
+                if e == dot + 1 {
+                    e = e + 1 // keep one fraction digit: "2.0"
+                }
+                s = str.Substr(s, 0, e)
+            }
+            return s
+        }
+        p = p + 1
+    }
+    return strconv.FormatFloat(v, 17)
+}
+
+// pad2/pad4/pad6 zero-pad integers for timestamp literals.
+fn pad2(v: int) -> string {
+    if v < 10 {
+        return str.Concat("0", strconv.Itoa64(int64(v)))
+    }
+    return strconv.Itoa64(int64(v))
+}
+
+fn pad4(v: int) -> string {
+    s := strconv.Itoa64(int64(v))
+    for str.Len(s) < 4 {
+        s = str.Concat("0", s)
+    }
+    return s
+}
+
+fn pad6(v: int) -> string {
+    s := strconv.Itoa64(int64(v))
+    for str.Len(s) < 6 {
+        s = str.Concat("0", s)
+    }
+    return s
+}
+
+// civilFromDays inverts daysFromCivil (Hinnant).
+fn civilFromDays(z: int64) -> (int, int, int) {
+    zz := z + int64(719468)
+    era := zz / int64(146097)
+    if zz < 0 && zz % int64(146097) != 0 {
+        era = era - 1
+    }
+    doe := zz - era * int64(146097)
+    yoe := (doe - doe / int64(1460) + doe / int64(36524) - doe / int64(146096)) / int64(365)
+    y := yoe + era * int64(400)
+    doy := doe - (int64(365) * yoe + yoe / int64(4) - yoe / int64(100))
+    mp := (int64(5) * doy + int64(2)) / int64(153)
+    d := doy - (int64(153) * mp + int64(2)) / int64(5) + int64(1)
+    m := mp + int64(3)
+    if mp >= int64(10) {
+        m = mp - int64(9)
+    }
+    if m <= int64(2) {
+        y = y + 1
+    }
+    return int(y), int(m), int(d)
+}

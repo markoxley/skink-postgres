@@ -1,0 +1,125 @@
+// File:    type_test.skink
+// Purpose: Unit tests for pg_type — OID → dbx_value decoding (text
+//          format), parameter encoding, timestamp parsing/formatting
+//          round-trips, and bytea hex decoding.
+module type_test
+
+import "pg_type"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/libc"
+import "std/testing"
+
+// TestDecodeInts covers int2/int4/int8/oid text decoding.
+pub fn TestDecodeInts() {
+    v := pg_type.Decode(pg_type.OID_INT4, "42", 2)
+    testing.AssertEqualInt(dbx_value.KIND_INT, v.Kind, "int4 kind")
+    testing.AssertTrue(v.I64 == int64(42), "int4 value")
+    v = pg_type.Decode(pg_type.OID_INT8, "-9223372036854775807", 19)
+    testing.AssertTrue(v.I64 == int64(-9223372036854775807), "int8 value")
+    bad := pg_type.Decode(pg_type.OID_INT4, "notanum", 7)
+    testing.AssertEqualInt(dbx_value.KIND_TEXT, bad.Kind, "bad int falls back to text")
+}
+
+// TestDecodeBoolFloat covers bool and float text decoding.
+pub fn TestDecodeBoolFloat() {
+    t := pg_type.Decode(pg_type.OID_BOOL, "t", 1)
+    testing.AssertTrue(t.Bool, "true")
+    f := pg_type.Decode(pg_type.OID_BOOL, "f", 1)
+    testing.AssertFalse(f.Bool, "false")
+    fl := pg_type.Decode(pg_type.OID_FLOAT8, "3.25", 4)
+    testing.AssertEqualInt(dbx_value.KIND_FLOAT, fl.Kind, "float kind")
+    testing.AssertEqualFloat(3.25, fl.F64, "float value")
+}
+
+// TestDecodeBytea covers "\x" hex bytea decoding including NULs.
+pub fn TestDecodeBytea() {
+    v := pg_type.Decode(pg_type.OID_BYTEA, "\\x00ff10", 8)
+    testing.AssertEqualInt(dbx_value.KIND_BLOB, v.Kind, "bytea kind")
+    testing.AssertEqualInt(3, v.Len, "bytea len")
+    testing.AssertEqualInt(0, v.Str[0], "byte 0")
+    testing.AssertEqualInt(255, v.Str[1], "byte 1")
+    testing.AssertEqualInt(16, v.Str[2], "byte 2")
+}
+
+// TestDecodeText keeps numeric/uuid/json as text for precision.
+pub fn TestDecodeText() {
+    num := pg_type.Decode(pg_type.OID_NUMERIC, "123456789.987654321123456789", 28)
+    testing.AssertEqualInt(dbx_value.KIND_TEXT, num.Kind, "numeric stays text")
+    testing.AssertEqualString("123456789.987654321123456789", num.Str, "numeric preserved")
+    u := pg_type.Decode(pg_type.OID_UUID, "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", 36)
+    testing.AssertEqualInt(dbx_value.KIND_TEXT, u.Kind, "uuid text")
+}
+
+// TestTimestampParse exercises the civil-date decoder.
+pub fn TestTimestampParse() {
+    // 1970-01-01 00:00:00 UTC = 0
+    us, ok := pg_type.ParseTimestampMicros("1970-01-01 00:00:00")
+    testing.AssertTrue(ok, "epoch parses")
+    testing.AssertTrue(us == int64(0), "epoch micros")
+    // 2000-01-01 = 10957 days
+    us, ok = pg_type.ParseTimestampMicros("2000-01-01")
+    testing.AssertTrue(ok, "y2k parses")
+    testing.AssertTrue(us == int64(10957) * int64(86400000000), "y2k micros")
+    // fraction + positive tz: 12:00:00.5+02:00 → 10:00:00.500000 UTC
+    us, ok = pg_type.ParseTimestampMicros("2024-03-01 12:00:00.5+02:00")
+    testing.AssertTrue(ok, "tz parses")
+    v := pg_type.Decode(pg_type.OID_TIMESTAMP, "2024-03-01 10:00:00.5", 20)
+    testing.AssertEqualInt(dbx_value.KIND_TIME, v.Kind, "timestamp kind")
+    testing.AssertTrue(us == v.I64, "tz normalization")
+}
+
+// TestTimeDecode covers the time-of-day OID.
+pub fn TestTimeDecode() {
+    v := pg_type.Decode(pg_type.OID_TIME, "01:02:03.5", 10)
+    testing.AssertEqualInt(dbx_value.KIND_TIME, v.Kind, "time kind")
+    expect := int64(3600 + 120 + 3) * int64(1000000) + int64(500000)
+    testing.AssertTrue(v.I64 == expect, "time micros")
+}
+
+// TestEncodeScalars covers the Bind param encoder.
+pub fn TestEncodeScalars() {
+    s, n, isNull := pg_type.Encode(dbx_value.Int(int64(42)))
+    testing.AssertEqualString("42", s, "int encode")
+    testing.AssertEqualInt(2, n, "int len")
+    testing.AssertFalse(isNull, "int not null")
+
+    s, n, isNull = pg_type.Encode(dbx_value.Null())
+    testing.AssertTrue(isNull, "null flag")
+
+    s, n, isNull = pg_type.Encode(dbx_value.Bool(true))
+    testing.AssertEqualString("t", s, "bool true")
+
+    s, n, isNull = pg_type.Encode(dbx_value.Text("hi"))
+    testing.AssertEqualString("hi", s, "text")
+
+    s, n, isNull = pg_type.Encode(dbx_value.Float(1.5))
+    testing.AssertEqualString("1.5", s, "float shortest")
+    s, n, isNull = pg_type.Encode(dbx_value.Float(0.1))
+    testing.AssertEqualString("0.1", s, "float 0.1")
+}
+
+// TestEncodeBytea covers bytea param escaping.
+pub fn TestEncodeBytea() {
+    raw := libc.malloc(3)
+    raw[0] = 0
+    raw[1] = 255
+    raw[2] = 0
+    blob := dbx_value.Blob(raw, 2)
+    s, n, isNull := pg_type.Encode(blob)
+    testing.AssertFalse(isNull, "bytea not null")
+    testing.AssertEqualInt(6, n, "bytea len")
+    testing.AssertEqualString("\\x00ff", s, "bytea hex")
+}
+
+// TestTimeRoundTrip formats then re-parses a timestamp value.
+pub fn TestTimeRoundTrip() {
+    s, n, _ := pg_type.Encode(dbx_value.TimeUnixMicros(int64(0)))
+    testing.AssertEqualString("1970-01-01 00:00:00.000000", s, "epoch format")
+    s, n, _ = pg_type.Encode(dbx_value.TimeUnixMicros(int64(1709258400123456)))
+    // 2024-03-01 02:00:00.123456 UTC
+    testing.AssertEqualString("2024-03-01 02:00:00.123456", s, "format with micros")
+    us, ok := pg_type.ParseTimestampMicros(s)
+    testing.AssertTrue(ok, "reparses")
+    testing.AssertTrue(us == int64(1709258400123456), "roundtrip micros")
+}

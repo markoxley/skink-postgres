@@ -1,0 +1,18 @@
+# Skink Project Manifest (managed by scales)
+
+[package]
+name = "postgres"
+version = "0.1.0"
+author = "mark"
+entry = "postgres.skink"
+description = "PostgreSQL driver for Skink: pure-Skink v3 wire protocol, cleartext/MD5/SCRAM-SHA-256 auth, simple + extended query, text-format type decoding, TLS, and a dbx driver adapter"
+license = "Apache-2.0"
+
+[target]
+env = "std"
+no_std = false
+os = "any"
+arch = "any"
+
+[dependencies]
+"mod/markoxley/skink-dbx" = "0.1.0"

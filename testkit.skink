@@ -1,0 +1,303 @@
+// File:    testkit.skink
+// Purpose: In-process fake PostgreSQL backend for unit tests. Speaks
+//          just enough of the v3 protocol — optional SSLRequest
+//          (answered 'N'), StartupMessage, then AuthenticationOk +
+//          ParameterStatus + BackendKeyData + ReadyForQuery — followed
+//          by a scripted loop: a caller-supplied handler decodes each
+//          frontend message and returns the backend messages to send.
+//
+//          Kept out of the *_test.skink naming scheme on purpose — the
+//          suite harness treats every file matching *_test*.skink as a
+//          standalone test suite.
+module testkit
+
+import "std/str"
+import "std/libc"
+import "std/net"
+import "std/errors"
+import "std/waitgroup"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "pg_msg"
+
+// request kinds
+pub const ReqSimple = 0 // 'Q' — Sql set
+pub const ReqParse  = 1 // 'P' — Sql set
+pub const ReqBind   = 2 // 'B' — Params set
+pub const ReqOther  = 3 // Describe/Execute/other — MsgType set
+
+// FakeReq is one decoded frontend message handed to the handler.
+pub struct FakeReq {
+    Kind:    int
+    MsgType: int      // raw message type byte
+    Sql:     string   // 'Q' query text / 'P' statement sql
+    Params:  []string // 'B' bound parameter bytes (text; "<NULL>" for SQL NULL)
+}
+
+// FakeServer is a scripted backend listening on one loopback port.
+pub struct FakeServer {
+    listener: net.Connection
+    Port:     int
+}
+
+// dupN copies n bytes into a fresh NUL-terminated buffer.
+fn dupN(s: string, n: int) -> string {
+    out := libc.malloc(n + 1)
+    libc.memcpy(out, s, n)
+    out[n] = 0
+    return out
+}
+
+// msgOf wraps a built body into a Msg.
+fn msgOf(t: int, b: *pg_msg.OutBuf) -> pg_msg.Msg {
+    body, n := pg_msg.Data(b)
+    return pg_msg.Msg{Type: t, Body: dupN(body, n), BodyLen: n}
+}
+
+// ---- canned message builders ------------------------------------------
+
+// ReadyTx builds ReadyForQuery with an explicit tx status byte
+// ('I' idle, 'T' in tx, 'E' failed tx). Every script must end with one.
+pub fn ReadyTx(status: int) -> pg_msg.Msg {
+    b := pg_msg.NewOutBuf(1)
+    pg_msg.Byte(&b, status)
+    m := msgOf(90, &b) // 'Z'
+    pg_msg.Free(&b)
+    return m
+}
+
+// Ready builds ReadyForQuery('I').
+pub fn Ready() -> pg_msg.Msg {
+    return ReadyTx(73)
+}
+
+// AuthOK builds AuthenticationOk + ParameterStatus + BackendKeyData.
+pub fn AuthOK() -> []pg_msg.Msg {
+    b := pg_msg.NewOutBuf(4)
+    pg_msg.I32(&b, 0)
+    auth := msgOf(82, &b) // 'R' AuthenticationOk
+    pg_msg.Free(&b)
+
+    b = pg_msg.NewOutBuf(24)
+    pg_msg.CStr(&b, "server_version")
+    pg_msg.CStr(&b, "15.0 (fake)")
+    ps := msgOf(83, &b) // 'S'
+    pg_msg.Free(&b)
+
+    b = pg_msg.NewOutBuf(8)
+    pg_msg.I32(&b, 4242)
+    pg_msg.I32(&b, 777)
+    key := msgOf(75, &b) // 'K'
+    pg_msg.Free(&b)
+
+    return []pg_msg.Msg{auth, ps, key}
+}
+
+// ErrorMsg builds an ErrorResponse with the given sqlstate + message.
+pub fn ErrorMsg(code: string, msg: string) -> pg_msg.Msg {
+    b := pg_msg.NewOutBuf(str.Len(msg) + 16)
+    pg_msg.Byte(&b, 83)
+    pg_msg.CStr(&b, "ERROR")
+    pg_msg.Byte(&b, 67)
+    pg_msg.CStr(&b, code)
+    pg_msg.Byte(&b, 77)
+    pg_msg.CStr(&b, msg)
+    pg_msg.Byte(&b, 0)
+    m := msgOf(69, &b) // 'E'
+    pg_msg.Free(&b)
+    return m
+}
+
+// RowMsg builds a DataRow from text cells.
+pub fn RowMsg(cells: []string) -> pg_msg.Msg {
+    b := pg_msg.NewOutBuf(16)
+    pg_msg.I16(&b, len(cells))
+    for i := 0; i < len(cells); i = i + 1 {
+        pg_msg.I32(&b, str.Len(cells[i]))
+        pg_msg.WriteN(&b, cells[i], str.Len(cells[i]))
+    }
+    m := msgOf(68, &b) // 'D'
+    pg_msg.Free(&b)
+    return m
+}
+
+// NullRowMsg builds a DataRow where cells[i] is NULL when nulls[i].
+pub fn NullRowMsg(cells: []string, nulls: []bool) -> pg_msg.Msg {
+    b := pg_msg.NewOutBuf(16)
+    pg_msg.I16(&b, len(cells))
+    for i := 0; i < len(cells); i = i + 1 {
+        if nulls[i] {
+            pg_msg.I32(&b, -1)
+        } else {
+            pg_msg.I32(&b, str.Len(cells[i]))
+            pg_msg.WriteN(&b, cells[i], str.Len(cells[i]))
+        }
+    }
+    m := msgOf(68, &b)
+    pg_msg.Free(&b)
+    return m
+}
+
+// DescMsg builds a RowDescription for column names + OIDs (text format).
+pub fn DescMsg(names: []string, oids: []int) -> pg_msg.Msg {
+    b := pg_msg.NewOutBuf(8 + len(names) * 16)
+    pg_msg.I16(&b, len(names))
+    for i := 0; i < len(names); i = i + 1 {
+        pg_msg.CStr(&b, names[i])
+        pg_msg.I32(&b, 0)    // table oid
+        pg_msg.I16(&b, 0)    // attnum
+        pg_msg.I32(&b, oids[i])
+        pg_msg.I16(&b, -1)   // typlen -1 = varlena
+        pg_msg.I32(&b, -1)   // typmod
+        pg_msg.I16(&b, 0)    // format text
+    }
+    m := msgOf(84, &b) // 'T'
+    pg_msg.Free(&b)
+    return m
+}
+
+// CompleteMsg builds a CommandComplete with the given tag
+// (e.g. "SELECT 2", "INSERT 0 1", "BEGIN").
+pub fn CompleteMsg(tag: string) -> pg_msg.Msg {
+    b := pg_msg.NewOutBuf(str.Len(tag) + 1)
+    pg_msg.CStr(&b, tag)
+    m := msgOf(67, &b) // 'C'
+    pg_msg.Free(&b)
+    return m
+}
+
+// ParseOK/BindOK build the extended-protocol bookkeeping messages.
+pub fn ParseOK() -> pg_msg.Msg {
+    return pg_msg.Msg{Type: 49, Body: "", BodyLen: 0} // '1'
+}
+
+pub fn BindOK() -> pg_msg.Msg {
+    return pg_msg.Msg{Type: 50, Body: "", BodyLen: 0} // '2'
+}
+
+// ---- request decode -----------------------------------------------------
+
+// decodeBind parses a Bind body, returning its text parameter bytes.
+fn decodeBind(m: pg_msg.Msg) -> []string {
+    c := pg_msg.NewCursor(m.Body, m.BodyLen)
+    pg_msg.CCStr(&c) // portal
+    pg_msg.CCStr(&c) // statement
+    var params []string
+    nfmt := pg_msg.CI16(&c)
+    for i := 0; i < nfmt; i = i + 1 {
+        pg_msg.CI16(&c)
+    }
+    npar := pg_msg.CI16(&c)
+    for i := 0; i < npar; i = i + 1 {
+        ln := pg_msg.CI32(&c)
+        if ln < 0 {
+            params = append(params, "<NULL>")
+        } else {
+            s, _ := pg_msg.CBytes(&c, ln)
+            params = append(params, s)
+        }
+    }
+    return params
+}
+
+// decodeParse extracts the sql from a Parse body.
+fn decodeParse(m: pg_msg.Msg) -> string {
+    c := pg_msg.NewCursor(m.Body, m.BodyLen)
+    pg_msg.CCStr(&c) // statement name
+    return pg_msg.CCStr(&c)
+}
+
+// ---- server -----------------------------------------------------------
+
+// sendOne frames and writes one Msg.
+fn sendOne(bc: *dbx_bufconn.BufConn, m: pg_msg.Msg) {
+    pg_msg.SendMsg(bc, m.Type, m.Body, m.BodyLen)
+}
+
+// Serve accepts one connection and serves `turns` frontend messages:
+// it answers the startup/SSL preambles itself, then for each message
+// calls respond with the decoded FakeReq and sends back the returned
+// script. A nil-ish return stops the loop. Designed to run under
+// `spawn`; signals the waitgroup when done.
+pub fn Serve(fs: *FakeServer, turns: int, respond: fn(FakeReq) -> []pg_msg.Msg, wg: *waitgroup.WaitGroup) {
+    conn, err := net.Accept(fs.listener)
+    if str.Len(err.message) > 0 {
+        waitgroup.Done(wg)
+        return
+    }
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", fs.Port)
+
+    // First packet: SSLRequest or StartupMessage (both untyped).
+    hdr, herr := bc.PeekN(8)
+    if str.Len(herr.message) > 0 {
+        bc.Close()
+        waitgroup.Done(wg)
+        return
+    }
+    plen := pg_msg.ReadI32(hdr, 0)
+    if plen == 8 && pg_msg.ReadI32(hdr, 4) == pg_msg.SSL_REQUEST_CODE {
+        bc.ReadN(8)
+        bc.WriteAll("N", 1)
+        hdr, herr = bc.PeekN(8)
+        if str.Len(herr.message) > 0 {
+            bc.Close()
+            waitgroup.Done(wg)
+            return
+        }
+        plen = pg_msg.ReadI32(hdr, 0)
+    }
+    if plen > 0 && plen < 65536 {
+        bc.ReadN(plen) // consume startup body
+    }
+
+    // Handshake, then scripted loop.
+    hs := AuthOK()
+    for i := 0; i < len(hs); i = i + 1 {
+        sendOne(&bc, hs[i])
+    }
+    sendOne(&bc, Ready())
+
+    for i := 0; i < turns; i = i + 1 {
+        m, rerr := pg_msg.ReadMsg(&bc)
+        if str.Len(rerr.message) > 0 {
+            break
+        }
+        if m.Type == 88 { // 'X' Terminate
+            break
+        }
+        req := FakeReq{MsgType: m.Type, Kind: ReqOther}
+        if m.Type == 81 { // 'Q'
+            req.Kind = ReqSimple
+            cur := pg_msg.NewCursor(m.Body, m.BodyLen)
+            req.Sql = pg_msg.CCStr(&cur)
+        } else if m.Type == 80 { // 'P'
+            req.Kind = ReqParse
+            req.Sql = decodeParse(m)
+        } else if m.Type == 66 { // 'B'
+            req.Kind = ReqBind
+            req.Params = decodeBind(m)
+        }
+        script := respond(req)
+        if len(script) == 0 {
+            break
+        }
+        for j := 0; j < len(script); j = j + 1 {
+            sendOne(&bc, script[j])
+        }
+    }
+    bc.Close()
+    fs.listener.Close()
+    waitgroup.Done(wg)
+}
+
+// StartFakeServer listens on the given loopback port (0 = ephemeral)
+// and returns the FakeServer plus an armed waitgroup — callers spawn
+// Serve then dial the returned Port.
+pub fn StartFakeServer(port: int) -> (FakeServer, *waitgroup.WaitGroup, errors.Error) {
+    listener, err := net.Listen("127.0.0.1", port)
+    if str.Len(err.message) > 0 {
+        return FakeServer{}, nil, err
+    }
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    return FakeServer{listener: listener, Port: port}, wg, errors.New("")
+}

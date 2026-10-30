@@ -1,0 +1,147 @@
+// File:    pg_dbx.skink
+// Purpose: dbx driver adapter for PostgreSQL. Registers a dbx.Driver
+//          under the "postgres" scheme ("postgresql://" is normalised
+//          by dbx.Open) so generic code can reach PostgreSQL through
+//          dbx.Open.
+//
+//          '?' bind markers in the sql are rewritten to $1..$N before
+//          hitting the wire; @name/$name styles pass through untouched
+//          for callers writing native PostgreSQL.
+module pg_dbx
+
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "mod/markoxley/skink-dbx/dbx_rows"
+import "mod/markoxley/skink-dbx/dbx_driver"
+import "pg_conn"
+import "std/str"
+import "std/errors"
+
+// connBoxes is the handle table behind Conn.State — Skink cannot cast
+// an int64 back to a *PgConn, so each connection lives in a len-1 slice
+// (a stable heap pointer) stored under an int handle.
+var connBoxes map[int][]pg_conn.PgConn
+var connNext = 1
+
+// boxConn stores a PgConn and returns its handle.
+fn boxConn(c: pg_conn.PgConn) -> int64 {
+    if connBoxes == nil {
+        connBoxes = make(map[int][]pg_conn.PgConn)
+    }
+    s := make([]pg_conn.PgConn, 1)
+    s[0] = c
+    h := connNext
+    connNext = connNext + 1
+    connBoxes[h] = s
+    return int64(h)
+}
+
+// connOf recovers the *PgConn from a Conn's opaque State.
+fn connOf(c: *dbx_driver.Conn) -> *pg_conn.PgConn {
+    return &connBoxes[int(c.State)][0]
+}
+
+// dropConn releases a handle's box.
+fn dropConn(h: int64) {
+    if connBoxes != nil {
+        delete(connBoxes, int(h))
+    }
+}
+
+// rowsOf adapts a QueryResult into dbx_rows.Rows.
+fn rowsOf(res: pg_conn.QueryResult) -> dbx_rows.Rows {
+    return dbx_rows.NewRows(res.Columns, res.Data)
+}
+
+fn queryImpl(c: *dbx_driver.Conn, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+    pg := connOf(c)
+    res, err := pg_conn.Query(pg, pg_conn.RewritePlaceholders(sql), args)
+    if str.Len(err.message) > 0 {
+        return dbx_rows.NewRows([]string{}, [][]dbx_value.Value{}), err
+    }
+    return rowsOf(res), errors.New("")
+}
+
+fn execImpl(c: *dbx_driver.Conn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    pg := connOf(c)
+    return pg_conn.Exec(pg, pg_conn.RewritePlaceholders(sql), args)
+}
+
+fn pingImpl(c: *dbx_driver.Conn) -> errors.Error {
+    return pg_conn.Ping(connOf(c))
+}
+
+fn closeImpl(c: *dbx_driver.Conn) -> errors.Error {
+    err := pg_conn.Close(connOf(c))
+    dropConn(c.State)
+    return err
+}
+
+// === transactions ===
+
+fn txConn(t: *dbx_driver.Tx) -> *pg_conn.PgConn {
+    return &connBoxes[int(t.State)][0]
+}
+
+fn txQueryImpl(t: *dbx_driver.Tx, sql: string, args: []dbx_value.Value) -> (dbx_rows.Rows, errors.Error) {
+    pg := txConn(t)
+    res, err := pg_conn.Query(pg, pg_conn.RewritePlaceholders(sql), args)
+    if str.Len(err.message) > 0 {
+        return dbx_rows.NewRows([]string{}, [][]dbx_value.Value{}), err
+    }
+    return rowsOf(res), errors.New("")
+}
+
+fn txExecImpl(t: *dbx_driver.Tx, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    pg := txConn(t)
+    return pg_conn.Exec(pg, pg_conn.RewritePlaceholders(sql), args)
+}
+
+fn txCommitImpl(t: *dbx_driver.Tx) -> errors.Error {
+    pg := txConn(t)
+    err := pg_conn.CommitTx(pg)
+    return err
+}
+
+fn txRollbackImpl(t: *dbx_driver.Tx) -> errors.Error {
+    pg := txConn(t)
+    err := pg_conn.RollbackTx(pg)
+    return err
+}
+
+fn beginImpl(c: *dbx_driver.Conn) -> (dbx_driver.Tx, errors.Error) {
+    pg := connOf(c)
+    err := pg_conn.Begin(pg)
+    if str.Len(err.message) > 0 {
+        return dbx_driver.Tx{}, err
+    }
+    c.InTx = true
+    t := dbx_driver.Tx{State: c.State}
+    t.queryFn = txQueryImpl
+    t.execFn = txExecImpl
+    t.commitFn = txCommitImpl
+    t.rollbackFn = txRollbackImpl
+    return t, errors.New("")
+}
+
+// openImpl is the dbx Driver.Open entry point for "postgres"/"postgresql".
+fn openImpl(info: dbx_dsn.ConnInfo) -> (dbx_driver.Conn, errors.Error) {
+    conn, err := pg_conn.Connect(info)
+    if str.Len(err.message) > 0 {
+        return dbx_driver.Conn{}, err
+    }
+    dc := dbx_driver.Conn{Name: "postgres", State: boxConn(conn)}
+    dc.queryFn = queryImpl
+    dc.execFn = execImpl
+    dc.pingFn = pingImpl
+    dc.beginFn = beginImpl
+    dc.closeFn = closeImpl
+    return dc, errors.New("")
+}
+
+// Register installs the PostgreSQL driver into the dbx registry so
+// dbx.Open("postgres://...") works. Call once at program start when the
+// generic dbx entry point is needed.
+pub fn Register() {
+    dbx_driver.RegisterDriver(dbx_driver.Driver{Name: "postgres", Open: openImpl})
+}

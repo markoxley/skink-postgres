@@ -1,0 +1,61 @@
+// File:    postgres.skink
+// Purpose: Root module for skink-postgres. Re-exports the connection
+//          and adapter entry points so applications need only
+//          `import "mod/markoxley/skink-postgres"`. Call
+//          postgres.Register() once to make "postgres://" /
+//          "postgresql://" DSNs work through the generic dbx.Open
+//          entry point.
+//
+//          Type names live in the submodules (pg_conn.PgConn,
+//          pg_conn.QueryResult, ...) — rely on `:=` inference, or import
+//          a submodule directly to name the types explicitly.
+module postgres
+
+import "pg_conn"
+import "pg_msg"
+import "pg_type"
+import "pg_dbx"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/errors"
+
+// Connect opens a connection from a parsed ConnInfo (see dbx_dsn).
+// DSN form:
+//   postgres://[user[:pass]@]host[:port][/database]
+//       [?sslmode=disable|prefer|require][&connect_timeout=N]
+//       [&application_name=...]
+pub fn Connect(info: dbx_dsn.ConnInfo) -> (pg_conn.PgConn, errors.Error) {
+    return pg_conn.Connect(info)
+}
+
+// Dial parses a postgres:// DSN and connects.
+pub fn Dial(dsn: string) -> (pg_conn.PgConn, errors.Error) {
+    info, err := dbx_dsn.ParseDSN(dsn)
+    if str.Len(err.message) > 0 {
+        return pg_conn.PgConn{}, err
+    }
+    return pg_conn.Connect(info)
+}
+
+// Query runs one parameterized statement (use RewritePlaceholders for
+// '?'-style SQL first, or write $1..$N directly).
+pub fn Query(c: *pg_conn.PgConn, sql: string, args: []dbx_value.Value) -> (pg_conn.QueryResult, errors.Error) {
+    return pg_conn.Query(c, sql, args)
+}
+
+// Exec runs sql and returns the affected-row count.
+pub fn Exec(c: *pg_conn.PgConn, sql: string, args: []dbx_value.Value) -> (int64, errors.Error) {
+    return pg_conn.Exec(c, sql, args)
+}
+
+// RewritePlaceholders converts '?' markers to $1..$N.
+pub fn RewritePlaceholders(sql: string) -> string {
+    return pg_conn.RewritePlaceholders(sql)
+}
+
+// Register installs the driver into the dbx registry so
+// dbx.Open("postgres://...") works.
+pub fn Register() {
+    pg_dbx.Register()
+}

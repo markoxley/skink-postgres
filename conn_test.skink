@@ -1,0 +1,192 @@
+// File:    conn_test.skink
+// Purpose: Integration tests for pg_conn — startup/auth against a
+//          scripted fake backend (testkit), simple + extended query
+//          flows, parameter binding bytes on the wire, error responses,
+//          and transaction state.
+module conn_test
+
+import "pg_msg"
+import "pg_conn"
+import "pg_type"
+import "testkit"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/strconv"
+import "std/testing"
+import "std/waitgroup"
+
+// lastBindParams captures the params the fake server decoded from Bind.
+var lastBindParams []string
+
+// simpleHandler answers 'Q' with a two-column one-row result.
+fn simpleHandler(req: testkit.FakeReq) -> []pg_msg.Msg {
+    if req.Kind == testkit.ReqSimple {
+        return []pg_msg.Msg{
+            testkit.DescMsg([]string{"id", "name"}, []int{pg_type.OID_INT4, pg_type.OID_TEXT}),
+            testkit.RowMsg([]string{"7", "ada"}),
+            testkit.CompleteMsg("SELECT 1"),
+            testkit.Ready(),
+        }
+    }
+    return []pg_msg.Msg{testkit.Ready()}
+}
+
+// TestSimpleQuery exercises Connect + 'Q' + row decode.
+pub fn TestSimpleQuery() {
+    fs, wg, serr := testkit.StartFakeServer(15501)
+    testing.AssertTrue(str.Len(serr.message) == 0, "fake server starts")
+    spawn testkit.Serve(&fs, 1, simpleHandler, wg)
+
+    info, perr := dbx_dsn.ParseDSN(str.Concat("postgres://u@127.0.0.1:", str.Concat(strconv.Itoa(fs.Port), "/db")))
+    testing.AssertTrue(str.Len(perr.message) == 0, "dsn parses")
+    c, cerr := pg_conn.Connect(info)
+    testing.AssertTrue(str.Len(cerr.message) == 0, str.Concat("connect: ", cerr.message))
+    testing.AssertTrue(c.Pid == 4242, "backend pid captured")
+    testing.AssertEqualString("15.0 (fake)", c.ServerVersion, "server_version param")
+    testing.AssertEqualInt(73, c.TxStatus, "idle tx status")
+
+    res, qerr := pg_conn.SimpleQuery(&c, "SELECT id, name FROM users")
+    testing.AssertTrue(str.Len(qerr.message) == 0, str.Concat("query: ", qerr.message))
+    testing.AssertEqualInt(2, len(res.Columns), "column count")
+    testing.AssertEqualString("id", res.Columns[0], "col 0 name")
+    testing.AssertEqualInt(1, len(res.Data), "row count")
+    testing.AssertEqualInt(dbx_value.KIND_INT, res.Data[0][0].Kind, "id decoded as int")
+    testing.AssertTrue(res.Data[0][0].I64 == int64(7), "id value")
+    testing.AssertEqualString("ada", res.Data[0][1].Str, "name value")
+    testing.AssertEqualInt(73, c.TxStatus, "still idle after query")
+    pg_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+// extHandler answers the extended-protocol sequence; records Bind params.
+fn extHandler(req: testkit.FakeReq) -> []pg_msg.Msg {
+    if req.Kind == testkit.ReqParse {
+        return []pg_msg.Msg{testkit.ParseOK()}
+    }
+    if req.Kind == testkit.ReqBind {
+        lastBindParams = req.Params
+        return []pg_msg.Msg{testkit.BindOK()}
+    }
+    if req.MsgType == 68 { // 'D' Describe
+        return []pg_msg.Msg{
+            testkit.DescMsg([]string{"n", "flag"}, []int{pg_type.OID_INT8, pg_type.OID_BOOL}),
+        }
+    }
+    if req.MsgType == 69 { // 'E' Execute
+        return []pg_msg.Msg{
+            testkit.NullRowMsg([]string{"123", ""}, []bool{false, true}),
+            testkit.CompleteMsg("SELECT 1"),
+        }
+    }
+    if req.MsgType == 83 { // 'S' Sync
+        return []pg_msg.Msg{testkit.Ready()}
+    }
+    return []pg_msg.Msg{}
+}
+
+// TestExtendedQuery exercises Parse/Bind/Describe/Execute/Sync and
+// verifies the bound parameter bytes on the wire.
+pub fn TestExtendedQuery() {
+    lastBindParams = []string{}
+    fs, wg, serr := testkit.StartFakeServer(15502)
+    testing.AssertTrue(str.Len(serr.message) == 0, "fake server starts")
+    spawn testkit.Serve(&fs, 5, extHandler, wg)
+
+    info, _ := dbx_dsn.ParseDSN(str.Concat("postgres://u@127.0.0.1:", str.Concat(strconv.Itoa(fs.Port), "/db")))
+    c, cerr := pg_conn.Connect(info)
+    testing.AssertTrue(str.Len(cerr.message) == 0, "connect")
+
+    res, qerr := pg_conn.Query(&c, "SELECT $1::bigint, $2::bool",
+        []dbx_value.Value{dbx_value.Int(int64(123)), dbx_value.Null()})
+    testing.AssertTrue(str.Len(qerr.message) == 0, str.Concat("query: ", qerr.message))
+    testing.AssertEqualInt(2, len(res.Columns), "columns")
+    testing.AssertEqualInt(1, len(res.Data), "rows")
+    testing.AssertTrue(res.Data[0][0].I64 == int64(123), "int8 value")
+    testing.AssertTrue(dbx_value.IsNull(res.Data[0][1]), "null flag col")
+    // Wire-level: Bind carried the int as text "123" and a NULL marker.
+    testing.AssertEqualInt(2, len(lastBindParams), "param count on wire")
+    if len(lastBindParams) == 2 {
+        testing.AssertEqualString("123", lastBindParams[0], "param 1 text")
+        testing.AssertEqualString("<NULL>", lastBindParams[1], "param 2 null")
+    }
+    pg_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+// errHandler answers 'Q' with an ErrorResponse.
+fn errHandler(req: testkit.FakeReq) -> []pg_msg.Msg {
+    if req.Kind == testkit.ReqSimple {
+        return []pg_msg.Msg{
+            testkit.ErrorMsg("42601", "syntax error at or near \"bogus\""),
+            testkit.Ready(),
+        }
+    }
+    return []pg_msg.Msg{testkit.Ready()}
+}
+
+// TestErrorResponse checks ErrorResponse → errors.Error mapping.
+pub fn TestErrorResponse() {
+    fs, wg, _ := testkit.StartFakeServer(15503)
+    spawn testkit.Serve(&fs, 1, errHandler, wg)
+    info, _ := dbx_dsn.ParseDSN(str.Concat("postgres://u@127.0.0.1:", str.Concat(strconv.Itoa(fs.Port), "/db")))
+    c, _ := pg_conn.Connect(info)
+    _, qerr := pg_conn.SimpleQuery(&c, "bogus sql")
+    testing.AssertTrue(str.Len(qerr.message) > 0, "error surfaces")
+    testing.AssertContains(qerr.message, "42601", "sqlstate in message")
+    testing.AssertContains(qerr.message, "syntax error", "message text")
+    pg_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+// txHandler answers BEGIN/COMMIT with matching CommandComplete tags
+// and the tx-status byte a real backend reports.
+fn txHandler(req: testkit.FakeReq) -> []pg_msg.Msg {
+    if req.Kind == testkit.ReqSimple {
+        if str.Equal(str.Trim(req.Sql), "BEGIN") {
+            return []pg_msg.Msg{testkit.CompleteMsg("BEGIN"), testkit.ReadyTx(84)} // 'T'
+        }
+        return []pg_msg.Msg{testkit.CompleteMsg("COMMIT"), testkit.Ready()}
+    }
+    return []pg_msg.Msg{testkit.Ready()}
+}
+
+// TestTxFlow covers Begin/CommitTx and the TxStatus byte propagation.
+pub fn TestTxFlow() {
+    fs, wg, _ := testkit.StartFakeServer(15504)
+    spawn testkit.Serve(&fs, 2, txHandler, wg)
+    info, _ := dbx_dsn.ParseDSN(str.Concat("postgres://u@127.0.0.1:", str.Concat(strconv.Itoa(fs.Port), "/db")))
+    c, _ := pg_conn.Connect(info)
+
+    berr := pg_conn.Begin(&c)
+    testing.AssertTrue(str.Len(berr.message) == 0, "begin ok")
+    testing.AssertEqualInt(84, c.TxStatus, "in tx")
+    cerr := pg_conn.CommitTx(&c)
+    testing.AssertTrue(str.Len(cerr.message) == 0, "commit ok")
+    testing.AssertEqualInt(73, c.TxStatus, "idle after commit")
+    pg_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+// TestRewritePlaceholders verifies '?' -> $N conversion skips quoted
+// and commented regions.
+pub fn TestRewritePlaceholders() {
+    got := pg_conn.RewritePlaceholders("SELECT * FROM t WHERE a = ? AND b = ?")
+    testing.AssertEqualString("SELECT * FROM t WHERE a = $1 AND b = $2", got, "basic")
+    got = pg_conn.RewritePlaceholders("SELECT '?' , ? -- ?\n")
+    testing.AssertEqualString("SELECT '?' , $1 -- ?\n", got, "quoted + comment skipped")
+    got = pg_conn.RewritePlaceholders("SELECT $1, ?")
+    testing.AssertEqualString("SELECT $1, $2", got, "native $N passes through")
+}
+
+// TestDollarQuotedPlaceholders — regression: '?' inside $$..$$ and
+// $tag$..$tag$ bodies is literal SQL text, not a bind placeholder.
+pub fn TestDollarQuotedPlaceholders() {
+    got := pg_conn.RewritePlaceholders("SELECT $$a?b$$, ?")
+    testing.AssertEqualString("SELECT $$a?b$$, $1", got, "empty dollar tag")
+    got = pg_conn.RewritePlaceholders("SELECT $f$x?y$f$, ?")
+    testing.AssertEqualString("SELECT $f$x?y$f$, $1", got, "named dollar tag")
+    // Unterminated dollar quote falls back to literal '$'.
+    got = pg_conn.RewritePlaceholders("SELECT $x, ?")
+    testing.AssertEqualString("SELECT $x, $1", got, "non-tag $ passes through")
+}

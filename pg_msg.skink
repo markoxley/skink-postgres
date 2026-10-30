@@ -1,0 +1,254 @@
+// File:    pg_msg.skink
+// Purpose: PostgreSQL v3 wire-protocol framing over dbx_bufconn.
+//          Backend messages are a one-byte type tag followed by an
+//          int32 big-endian length (length includes itself, excludes
+//          the type byte) and the body. StartupMessage and SSLRequest
+//          are the two messages with no type byte.
+//
+//          Message bodies are binary — SCRAM digests and bytea values
+//          contain NUL bytes — so framing uses the explicit-length
+//          OutBuf/Cursor pair rather than strlen-based string helpers.
+module pg_msg
+
+import "std/str"
+import "std/libc"
+import "std/errors"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+
+// Protocol version 3.0 as sent in the startup packet.
+pub const PROTOCOL_V3 = 196608
+
+// SSLRequest magic (int32 1234<<16 | 5679).
+pub const SSL_REQUEST_CODE = 80877103
+
+// ---- output buffer ---------------------------------------------------
+
+// OutBuf is a growable byte buffer for building wire messages.
+pub struct OutBuf {
+    Buf: string
+    Len: int
+    Cap: int
+}
+
+// NewOutBuf allocates a buffer with the given initial capacity.
+pub fn NewOutBuf(cap: int) -> OutBuf {
+    return OutBuf{Buf: libc.malloc(cap + 1), Len: 0, Cap: cap + 1}
+}
+
+// grow ensures room for n more bytes.
+fn grow(b: *OutBuf, n: int) {
+    if b.Len + n + 1 <= b.Cap {
+        return
+    }
+    nc := b.Cap * 2
+    if nc < b.Len + n + 1 {
+        nc = b.Len + n + 1
+    }
+    nb := libc.malloc(nc)
+    libc.memcpy(nb, b.Buf, b.Len)
+    libc.free(b.Buf)
+    b.Buf = nb
+    b.Cap = nc
+}
+
+// Byte appends one byte.
+pub fn Byte(b: *OutBuf, v: int) {
+    grow(b, 1)
+    b.Buf[b.Len] = v & 255
+    b.Len = b.Len + 1
+    b.Buf[b.Len] = 0
+}
+
+// I16 appends a big-endian int16.
+pub fn I16(b: *OutBuf, v: int) {
+    Byte(b, (v >> 8) & 255)
+    Byte(b, v & 255)
+}
+
+// I32 appends a big-endian int32.
+pub fn I32(b: *OutBuf, v: int) {
+    Byte(b, (v >> 24) & 255)
+    Byte(b, (v >> 16) & 255)
+    Byte(b, (v >> 8) & 255)
+    Byte(b, v & 255)
+}
+
+// CStr appends a NUL-terminated string.
+pub fn CStr(b: *OutBuf, s: string) {
+    n := str.Len(s)
+    grow(b, n + 1)
+    libc.memcpy(string(int64(b.Buf) + int64(b.Len)), s, n + 1)
+    b.Len = b.Len + n + 1
+}
+
+// WriteN appends n bytes from s — binary-safe.
+pub fn WriteN(b: *OutBuf, s: string, n: int) {
+    if n <= 0 {
+        return
+    }
+    grow(b, n)
+    libc.memcpy(string(int64(b.Buf) + int64(b.Len)), s, n)
+    b.Len = b.Len + n
+    b.Buf[b.Len] = 0
+}
+
+// Data returns the accumulated bytes and their length.
+pub fn Data(b: *OutBuf) -> (string, int) {
+    return b.Buf, b.Len
+}
+
+// Free releases the buffer.
+pub fn Free(b: *OutBuf) {
+    if int64(b.Buf) != 0 {
+        libc.free(b.Buf)
+    }
+    b.Buf = ""
+    b.Len = 0
+    b.Cap = 0
+}
+
+// ---- message read/write ---------------------------------------------
+
+// Msg is one backend message: a type byte and its body. BodyLen carries
+// the exact wire length so binary payloads with NULs stay intact.
+pub struct Msg {
+    Type:    int
+    Body:    string
+    BodyLen: int
+}
+
+// readI32 decodes a big-endian int32 at p+off.
+pub fn ReadI32(p: string, off: int) -> int {
+    return (p[off] << 24) | (p[off + 1] << 16) | (p[off + 2] << 8) | p[off + 3]
+}
+
+// ReadMsg reads one backend message.
+pub fn ReadMsg(c: *dbx_bufconn.BufConn) -> (Msg, errors.Error) {
+    t, terr := c.ReadByte()
+    if str.Len(terr.message) > 0 {
+        return Msg{}, terr
+    }
+    lenBuf, lerr := c.ReadN(4)
+    if str.Len(lerr.message) > 0 {
+        return Msg{}, lerr
+    }
+    n := ReadI32(lenBuf, 0) - 4
+    if n < 0 || n > 268435456 { // 256 MiB sanity cap
+        return Msg{}, errors.New("pg: invalid message length")
+    }
+    body := ""
+    if n > 0 {
+        var berr errors.Error
+        body, berr = c.ReadN(n)
+        if str.Len(berr.message) > 0 {
+            return Msg{}, berr
+        }
+    }
+    return Msg{Type: t, Body: body, BodyLen: n}, errors.New("")
+}
+
+// SendMsg writes one typed message: type byte, int32 length, body.
+pub fn SendMsg(c: *dbx_bufconn.BufConn, t: int, body: string, bodyLen: int) -> errors.Error {
+    b := NewOutBuf(bodyLen + 5)
+    Byte(&b, t)
+    I32(&b, bodyLen + 4)
+    WriteN(&b, body, bodyLen)
+    out, n := Data(&b)
+    err := c.WriteAll(out, n)
+    Free(&b)
+    return err
+}
+
+// SendUntyped writes a type-less message (StartupMessage, SSLRequest):
+// int32 length + body.
+pub fn SendUntyped(c: *dbx_bufconn.BufConn, body: string, bodyLen: int) -> errors.Error {
+    b := NewOutBuf(bodyLen + 4)
+    I32(&b, bodyLen + 4)
+    WriteN(&b, body, bodyLen)
+    out, n := Data(&b)
+    err := c.WriteAll(out, n)
+    Free(&b)
+    return err
+}
+
+// ---- body cursor -----------------------------------------------------
+
+// Cursor walks a message body field-by-field.
+pub struct Cursor {
+    Body: string
+    Len:  int
+    Pos:  int
+}
+
+// NewCursor wraps a body for sequential field decoding.
+pub fn NewCursor(body: string, bodyLen: int) -> Cursor {
+    return Cursor{Body: body, Len: bodyLen, Pos: 0}
+}
+
+// CByte reads one byte, or -1 when exhausted.
+pub fn CByte(c: *Cursor) -> int {
+    if c.Pos >= c.Len {
+        return -1
+    }
+    v := c.Body[c.Pos]
+    c.Pos = c.Pos + 1
+    return v
+}
+
+// CI16 reads a big-endian int16.
+pub fn CI16(c: *Cursor) -> int {
+    if c.Pos + 2 > c.Len {
+        return -1
+    }
+    v := (c.Body[c.Pos] << 8) | c.Body[c.Pos + 1]
+    c.Pos = c.Pos + 2
+    return v
+}
+
+// CI32 reads a big-endian int32.
+pub fn CI32(c: *Cursor) -> int {
+    if c.Pos + 4 > c.Len {
+        return -1
+    }
+    v := ReadI32(c.Body, c.Pos)
+    c.Pos = c.Pos + 4
+    return v
+}
+
+// CCStr reads a NUL-terminated string; returns "" when none remains.
+pub fn CCStr(c: *Cursor) -> string {
+    start := c.Pos
+    for c.Pos < c.Len && c.Body[c.Pos] != 0 {
+        c.Pos = c.Pos + 1
+    }
+    n := c.Pos - start
+    out := libc.malloc(n + 1)
+    if n > 0 {
+        libc.memcpy(out, string(int64(c.Body) + int64(start)), n)
+    }
+    out[n] = 0
+    if c.Pos < c.Len {
+        c.Pos = c.Pos + 1 // skip the NUL
+    }
+    return out
+}
+
+// CBytes reads n raw bytes (may contain NULs); returns data + length.
+pub fn CBytes(c: *Cursor, n: int) -> (string, int) {
+    if n < 0 || c.Pos >= c.Len {
+        return "", 0
+    }
+    if c.Pos + n > c.Len {
+        n = c.Len - c.Pos
+    }
+    out := libc.malloc(n + 1)
+    libc.memcpy(out, string(int64(c.Body) + int64(c.Pos)), n)
+    out[n] = 0
+    c.Pos = c.Pos + n
+    return out, n
+}
+
+// Remaining reports unread byte count.
+pub fn Remaining(c: *Cursor) -> int {
+    return c.Len - c.Pos
+}

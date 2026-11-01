@@ -78,10 +78,14 @@ Results are requested in text format and decoded by type OID:
 
 ## Transactions
 
+Transaction helpers live in the `pg_conn` submodule:
+
 ```skink
-postgres.Begin(&c)
+import "mod/markoxley/skink-postgres/pg_conn"
+
+pg_conn.Begin(&c)
 // ... c used normally
-postgres.CommitTx(&c)   // or RollbackTx
+pg_conn.CommitTx(&c)   // or pg_conn.RollbackTx
 ```
 
 `c.TxStatus` tracks the `ReadyForQuery` status byte (`'I'` idle,
@@ -90,6 +94,9 @@ postgres.CommitTx(&c)   // or RollbackTx
 ## Generic dbx access
 
 ```skink
+import "mod/markoxley/skink-dbx"
+import "mod/markoxley/skink-dbx/dbx_value"
+
 postgres.Register() // installs the "postgres" scheme driver
 conn, err := dbx.Open("postgres://user:pass@host/db")
 rows, _ := conn.Query("SELECT * FROM t WHERE id = ?", []dbx_value.Value{...})

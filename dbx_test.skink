@@ -16,6 +16,12 @@ import "std/testing"
 import "std/waitgroup"
 import "std/errors"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // lastParseSql captures the rewritten SQL text from Parse messages.
 var lastParseSql string
 // lastParams captures Bind parameter text.

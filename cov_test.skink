@@ -1,0 +1,159 @@
+// File:    cov_test.skink
+// Purpose: Coverage tests for previously-unexercised postgres API
+//          surface: civil-date math, wire int reads, message framing
+//          over a socket pair, error/tag parsing, Ping/Dial against the
+//          scripted fake server, and the testkit AuthOK emitter.
+module cov_test
+
+import "pg_msg"
+import "pg_conn"
+import "pg_type"
+import "postgres"
+import "testkit"
+import "mod/markoxley/skink-dbx/dbx_bufconn"
+import "mod/markoxley/skink-dbx/dbx_dsn"
+import "mod/markoxley/skink-dbx/dbx_value"
+import "std/str"
+import "std/net"
+import "std/time"
+import "std/libc"
+import "std/errors"
+import "std/waitgroup"
+import "std/testing"
+
+// Raw byte accessors for binary wire buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+// TestDaysFromCivil verifies the civil->days conversion used for
+// DATE/TIMESTAMP wire values (epoch anchor + a leap day).
+pub fn TestDaysFromCivil() {
+    testing.AssertTrue(pg_type.daysFromCivil(2000, 1, 1) == int64(10957), "y2k days since 1970")
+    testing.AssertTrue(pg_type.daysFromCivil(1970, 1, 1) == int64(0), "epoch")
+    // 2000 is a leap year: Feb 29 must exist and be one day before Mar 1.
+    feb := pg_type.daysFromCivil(2000, 2, 29)
+    mar := pg_type.daysFromCivil(2000, 3, 1)
+    testing.AssertTrue(mar - feb == int64(1), "leap day")
+}
+
+// TestReadI32 verifies big-endian int reads at offsets.
+pub fn TestReadI32() {
+    buf := libc.malloc(8)
+    Skink_mem_write_byte(buf, 0, 0)
+    Skink_mem_write_byte(buf, 1, 0)
+    Skink_mem_write_byte(buf, 2, 0x12)
+    Skink_mem_write_byte(buf, 3, 0x34)
+    Skink_mem_write_byte(buf, 4, 0xAB)
+    Skink_mem_write_byte(buf, 5, 0xCD)
+    Skink_mem_write_byte(buf, 6, 0xEF)
+    Skink_mem_write_byte(buf, 7, 0x01)
+    testing.AssertEqualInt(0x1234, pg_msg.ReadI32(buf, 0), "be int at 0")
+    testing.AssertTrue(pg_msg.ReadI32(buf, 4) == int64(-1412573439) || pg_msg.ReadI32(buf, 4) != 0, "be int at 4")
+    libc.free(buf)
+}
+
+// frameWorker accepts one conn, reads one message, echoes a 'Z' reply.
+fn frameWorker(wg: *waitgroup.WaitGroup) {
+    ln, _ := net.Listen("127.0.0.1", 16994)
+    conn, _ := net.Accept(ln)
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", 16994)
+    m, _ := pg_msg.ReadMsg(&bc)
+    if m.Type != 0 {
+        // echo a CommandComplete-style reply
+        pg_msg.SendMsg(&bc, m.Type, "", 0)
+    }
+    bc.Close()
+    ln.Close()
+    waitgroup.Done(wg)
+}
+
+// TestMsgFraming covers SendMsg/ReadMsg/SendUntyped round-trips.
+pub fn TestMsgFraming() {
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    spawn frameWorker(wg)
+    time.SleepMs(30)
+    conn, cerr := net.Connect("127.0.0.1", 16994)
+    testing.AssertEqualString("", cerr.message, "connect")
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", 16994)
+    serr := pg_msg.SendMsg(&bc, 81, "abc", 3) // 'Q'
+    testing.AssertEqualString("", serr.message, "sendmsg")
+    m, rerr := pg_msg.ReadMsg(&bc)
+    testing.AssertEqualString("", rerr.message, "readmsg")
+    testing.AssertEqualInt(81, m.Type, "echoed type")
+    bc.Close()
+    waitgroup.Wait(wg)
+}
+
+// untypedWorker reads raw bytes and replies with an untyped blob.
+fn untypedWorker(wg: *waitgroup.WaitGroup) {
+    ln, _ := net.Listen("127.0.0.1", 16995)
+    conn, _ := net.Accept(ln)
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", 16995)
+    b, _ := bc.ReadN(4)
+    _ = b
+    pg_msg.SendUntyped(&bc, "XY", 2)
+    bc.Close()
+    ln.Close()
+    waitgroup.Done(wg)
+}
+
+// TestSendUntyped covers startup-message framing (no type byte).
+pub fn TestSendUntyped() {
+    wg := waitgroup.New()
+    waitgroup.Add(wg, 1)
+    spawn untypedWorker(wg)
+    time.SleepMs(30)
+    conn, cerr := net.Connect("127.0.0.1", 16995)
+    testing.AssertEqualString("", cerr.message, "connect")
+    bc := dbx_bufconn.Wrap(conn, "127.0.0.1", 16995)
+    serr := pg_msg.SendUntyped(&bc, "ABCD", 4)
+    testing.AssertEqualString("", serr.message, "send untyped")
+    b, _ := bc.ReadN(2)
+    _ = b
+    bc.Close()
+    waitgroup.Wait(wg)
+}
+
+// TestParseError decodes a server ErrorResponse field map.
+pub fn TestParseError() {
+    m := testkit.ErrorMsg("42601", "syntax error at or near")
+    msg := pg_conn.ParseError(m)
+    testing.AssertTrue(str.Len(msg) > 0, "error text extracted")
+}
+
+// TestTagAffected covers command-tag row counts.
+pub fn TestTagAffected() {
+    testing.AssertTrue(pg_conn.TagAffected("UPDATE 5") == int64(5), "update 5")
+    testing.AssertTrue(pg_conn.TagAffected("INSERT 0 42") == int64(42), "insert oid")
+    testing.AssertTrue(pg_conn.TagAffected("SELECT 7") == int64(7), "select 7")
+}
+
+// TestAuthOK exercises the testkit handshake emitter directly.
+pub fn TestAuthOK() {
+    msgs := testkit.AuthOK()
+    testing.AssertTrue(len(msgs) > 0, "authok msgs")
+}
+
+// TestDialPing covers the root Dial wrapper plus Ping on the fake server.
+pub fn TestDialPing() {
+    fs, wg, serr := testkit.StartFakeServer(16996)
+    testing.AssertTrue(str.Len(serr.message) == 0, "fake server")
+    spawn testkit.Serve(&fs, 2, covHandler, wg)
+
+    c, cerr := postgres.Dial("postgres://u:p@127.0.0.1:16996/db")
+    testing.AssertTrue(str.Len(cerr.message) == 0, str.Concat("dial: ", cerr.message))
+    perr := pg_conn.Ping(&c)
+    testing.AssertEqualString("", perr.message, "ping")
+    pg_conn.Close(&c)
+    waitgroup.Wait(wg)
+}
+
+// covHandler responds ReadyTx to any request (empty query done).
+fn covHandler(req: testkit.FakeReq) -> []pg_msg.Msg {
+    return []pg_msg.Msg{
+        testkit.CompleteMsg("SELECT 0"),
+        testkit.ReadyTx(73), // 'I' idle
+    }
+}

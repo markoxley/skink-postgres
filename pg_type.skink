@@ -17,6 +17,12 @@ import "std/strconv"
 import "std/fmt"
 import "mod/markoxley/skink-dbx/dbx_value"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // Common PostgreSQL type OIDs (pg_type catalog).
 pub const OID_BOOL        = 16
 pub const OID_BYTEA       = 17
@@ -65,7 +71,7 @@ pub fn daysFromCivil(y: int, m: int, d: int) -> int64 {
 fn digits(s: string, pos: *int, n: int) -> int {
     v := 0
     for i := 0; i < n; i = i + 1 {
-        c := s[*pos]
+        c := Skink_mem_byte(s, int64(*pos))
         if c < 48 || c > 57 {
             break
         }
@@ -86,10 +92,10 @@ pub fn ParseTimestampMicros(s: string) -> (int64, bool) {
     }
     pos := 0
     y := digits(s, &pos, 6)
-    if pos >= n || s[pos] != 45 { return int64(0), false } // '-'
+    if pos >= n || Skink_mem_byte(s, int64(pos)) != 45 { return int64(0), false } // '-'
     pos = pos + 1
     mo := digits(s, &pos, 2)
-    if pos >= n || s[pos] != 45 { return int64(0), false }
+    if pos >= n || Skink_mem_byte(s, int64(pos)) != 45 { return int64(0), false }
     pos = pos + 1
     dy := digits(s, &pos, 2)
     if y == 0 || mo < 1 || mo > 12 || dy < 1 || dy > 31 {
@@ -101,43 +107,43 @@ pub fn ParseTimestampMicros(s: string) -> (int64, bool) {
         return micros, true // bare date
     }
     // Separator between date and time: space or 'T'.
-    sep := s[pos]
+    sep := Skink_mem_byte(s, int64(pos))
     if sep != 32 && sep != 84 {
         return int64(0), false
     }
     pos = pos + 1
     hh := digits(s, &pos, 2)
-    if pos >= n || s[pos] != 58 { return int64(0), false }
+    if pos >= n || Skink_mem_byte(s, int64(pos)) != 58 { return int64(0), false }
     pos = pos + 1
     mi := digits(s, &pos, 2)
-    if pos >= n || s[pos] != 58 { return int64(0), false }
+    if pos >= n || Skink_mem_byte(s, int64(pos)) != 58 { return int64(0), false }
     pos = pos + 1
     ss := digits(s, &pos, 2)
     micros = micros + int64(hh * 3600 + mi * 60 + ss) * int64(1000000)
-    if pos < n && s[pos] == 46 { // '.ffffff' fraction
+    if pos < n && Skink_mem_byte(s, int64(pos)) == 46 { // '.ffffff' fraction
         pos = pos + 1
         frac := int64(0)
         scale := int64(100000)
         for pos < n && scale > 0 {
-            c := s[pos]
+            c := Skink_mem_byte(s, int64(pos))
             if c < 48 || c > 57 { break }
             frac = frac + int64(c - 48) * scale
             scale = scale / 10
             pos = pos + 1
         }
         // Consume any extra precision digits past 6.
-        for pos < n && s[pos] >= 48 && s[pos] <= 57 {
+        for pos < n && Skink_mem_byte(s, int64(pos)) >= 48 && Skink_mem_byte(s, int64(pos)) <= 57 {
             pos = pos + 1
         }
         micros = micros + frac
     }
     // Optional timezone offset "+HH[:MM]" / "-HH[:MM]" / 'Z'.
-    if pos < n && (s[pos] == 43 || s[pos] == 45) {
-        sign := s[pos]
+    if pos < n && (Skink_mem_byte(s, int64(pos)) == 43 || Skink_mem_byte(s, int64(pos)) == 45) {
+        sign := Skink_mem_byte(s, int64(pos))
         pos = pos + 1
         th := digits(s, &pos, 2)
         tm := 0
-        if pos < n && s[pos] == 58 {
+        if pos < n && Skink_mem_byte(s, int64(pos)) == 58 {
             pos = pos + 1
             tm = digits(s, &pos, 2)
         }
@@ -163,21 +169,21 @@ fn hexNibble(c: int) -> int {
 // into raw bytes, returning data + length.
 fn decodeBytea(s: string) -> (string, int) {
     n := str.Len(s)
-    if n >= 2 && s[0] == 92 && s[1] == 120 { // "\x" hex format
+    if n >= 2 && Skink_mem_byte(s, int64(0)) == 92 && Skink_mem_byte(s, int64(1)) == 120 { // "\x" hex format
         out := libc.malloc(n / 2 + 1)
         j := 0
         i := 2
         for i + 1 < n {
-            hi := hexNibble(s[i])
-            lo := hexNibble(s[i + 1])
+            hi := hexNibble(Skink_mem_byte(s, int64(i)))
+            lo := hexNibble(Skink_mem_byte(s, int64(i + 1)))
             if hi < 0 || lo < 0 {
                 break
             }
-            out[j] = hi * 16 + lo
+            Skink_mem_write_byte(out, int64(j), hi * 16 + lo)
             j = j + 1
             i = i + 2
         }
-        out[j] = 0
+        Skink_mem_write_byte(out, int64(j), 0)
         return out, j
     }
     // Legacy escape format: \ooo octal, \\ backslash.
@@ -185,25 +191,25 @@ fn decodeBytea(s: string) -> (string, int) {
     j := 0
     i := 0
     for i < n {
-        if s[i] == 92 && i + 1 < n {
-            if s[i + 1] == 92 {
-                out[j] = 92
+        if Skink_mem_byte(s, int64(i)) == 92 && i + 1 < n {
+            if Skink_mem_byte(s, int64(i + 1)) == 92 {
+                Skink_mem_write_byte(out, int64(j), 92)
                 j = j + 1
                 i = i + 2
             } else if i + 3 < n {
-                out[j] = (s[i + 1] - 48) * 64 + (s[i + 2] - 48) * 8 + (s[i + 3] - 48)
+                Skink_mem_write_byte(out, int64(j), (Skink_mem_byte(s, int64(i + 1)) - 48) * 64 + (Skink_mem_byte(s, int64(i + 2)) - 48) * 8 + (Skink_mem_byte(s, int64(i + 3)) - 48))
                 j = j + 1
                 i = i + 4
             } else {
                 i = i + 1
             }
         } else {
-            out[j] = s[i]
+            Skink_mem_write_byte(out, int64(j), Skink_mem_byte(s, int64(i)))
             j = j + 1
             i = i + 1
         }
     }
-    out[j] = 0
+    Skink_mem_write_byte(out, int64(j), 0)
     return out, j
 }
 
@@ -212,7 +218,7 @@ fn decodeBytea(s: string) -> (string, int) {
 // null flag keeps the boundary explicit.
 pub fn Decode(oid: int, data: string, n: int) -> dbx_value.Value {
     if oid == OID_BOOL {
-        return dbx_value.Bool(n > 0 && (data[0] == 116 || data[0] == 84)) // 't'|'T'
+        return dbx_value.Bool(n > 0 && (Skink_mem_byte(data, int64(0)) == 116 || Skink_mem_byte(data, int64(0)) == 84)) // 't'|'T'
     }
     if oid == OID_INT2 || oid == OID_INT4 || oid == OID_INT8 || oid == OID_OID {
         v, ok := strconv.ParseInt64(data)
@@ -237,19 +243,19 @@ pub fn Decode(oid: int, data: string, n: int) -> dbx_value.Value {
             // "HH:MM:SS[.f]" — microseconds since midnight.
             pos := 0
             hh := digits(data, &pos, 2)
-            if pos < n && data[pos] == 58 {
+            if pos < n && Skink_mem_byte(data, int64(pos)) == 58 {
                 pos = pos + 1
                 mi := digits(data, &pos, 2)
                 ss := 0
                 frac := int64(0)
-                if pos < n && data[pos] == 58 {
+                if pos < n && Skink_mem_byte(data, int64(pos)) == 58 {
                     pos = pos + 1
                     ss = digits(data, &pos, 2)
-                    if pos < n && data[pos] == 46 {
+                    if pos < n && Skink_mem_byte(data, int64(pos)) == 46 {
                         pos = pos + 1
                         scale := int64(100000)
-                        for pos < n && scale > 0 && data[pos] >= 48 && data[pos] <= 57 {
-                            frac = frac + int64(data[pos] - 48) * scale
+                        for pos < n && scale > 0 && Skink_mem_byte(data, int64(pos)) >= 48 && Skink_mem_byte(data, int64(pos)) <= 57 {
+                            frac = frac + int64(Skink_mem_byte(data, int64(pos)) - 48) * scale
                             scale = scale / 10
                             pos = pos + 1
                         }
@@ -299,15 +305,15 @@ pub fn Encode(v: dbx_value.Value) -> (string, int, bool) {
         // "\x<hex>" bytea literal.
         src := dbx_value.Bytes(v)
         out := libc.malloc(v.Len * 2 + 3)
-        out[0] = 92
-        out[1] = 120
+        Skink_mem_write_byte(out, int64(0), 92)
+        Skink_mem_write_byte(out, int64(1), 120)
         for i := 0; i < v.Len; i = i + 1 {
-            c := src[i]
-            out[2 + i * 2] = hexDigits[c >> 4]
-            out[3 + i * 2] = hexDigits[c & 15]
+            c := Skink_mem_byte(src, int64(i))
+            Skink_mem_write_byte(out, int64(2 + i * 2), hexDigits[c >> 4])
+            Skink_mem_write_byte(out, int64(3 + i * 2), hexDigits[c & 15])
         }
         n := v.Len * 2 + 2
-        out[n] = 0
+        Skink_mem_write_byte(out, int64(n), 0)
         return out, n, false
     }
     // Text / Time / unknown: emit as text. Time formats back to a
@@ -354,7 +360,7 @@ fn encodeFloat(v: float) -> string {
             dot := str.IndexOf(s, ".")
             if dot >= 0 {
                 e := str.Len(s)
-                for e > dot + 1 && s[e - 1] == 48 {
+                for e > dot + 1 && Skink_mem_byte(s, int64(e - 1)) == 48 {
                     e = e - 1
                 }
                 if e == dot + 1 {

@@ -21,6 +21,12 @@ import "mod/markoxley/skink-dbx/dbx_value"
 import "pg_msg"
 import "pg_type"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // MD5 from libcrypto — binary-safe (explicit length), unlike the
 // std/crypto convenience wrappers which measure with strlen.
 extern fn MD5(d: string, n: int64, md: string) -> string
@@ -34,10 +40,10 @@ fn md5Hex(data: string, n: int) -> string {
     MD5(data, int64(n), raw)
     out := libc.malloc(33)
     for i := 0; i < 16; i = i + 1 {
-        out[i * 2] = hexChars[raw[i] >> 4]
-        out[i * 2 + 1] = hexChars[raw[i] & 15]
+        Skink_mem_write_byte(out, int64(i * 2), hexChars[Skink_mem_byte(raw, int64(i)) >> 4])
+        Skink_mem_write_byte(out, int64(i * 2 + 1), hexChars[Skink_mem_byte(raw, int64(i)) & 15])
     }
-    out[32] = 0
+    Skink_mem_write_byte(out, int64(32), 0)
     libc.free(raw)
     return out
 }
@@ -348,7 +354,7 @@ pub fn Connect(info: dbx_dsn.ConnInfo) -> (PgConn, errors.Error) {
             return PgConn{}, errors.New(emsg)
         } else if m.Type == 90 { // 'Z' ReadyForQuery
             if m.BodyLen > 0 {
-                conn.TxStatus = m.Body[0]
+                conn.TxStatus = Skink_mem_byte(m.Body, int64(0))
             }
             return conn, errors.New("")
         }
@@ -465,7 +471,7 @@ pub fn RewritePlaceholders(sql: string) -> string {
                 for k + str.Len(tag) <= n {
                     hit := true
                     for q := 0; q < str.Len(tag); q = q + 1 {
-                        if sql[k + q] != tag[q] {
+                        if sql[k + q] != Skink_mem_byte(tag, int64(q)) {
                             hit = false
                             break
                         }
@@ -506,10 +512,10 @@ fn strconvItoa(v: int) -> string {
     buf := libc.malloc(12)
     n := v
     i := 11
-    buf[i] = 0
+    Skink_mem_write_byte(buf, int64(i), 0)
     for n > 0 {
         i = i - 1
-        buf[i] = 48 + (n % 10)
+        Skink_mem_write_byte(buf, int64(i), 48 + (n % 10))
         n = n / 10
     }
     return string(int64(buf) + int64(i))
@@ -525,7 +531,7 @@ pub fn TagAffected(tag: string) -> int64 {
     // find last space
     sp := -1
     for i := 0; i < n; i = i + 1 {
-        if tag[i] == 32 {
+        if Skink_mem_byte(tag, int64(i)) == 32 {
             sp = i
         }
     }
@@ -535,7 +541,7 @@ pub fn TagAffected(tag: string) -> int64 {
     v := int64(0)
     any := false
     for i := sp + 1; i < n; i = i + 1 {
-        c := tag[i]
+        c := Skink_mem_byte(tag, int64(i))
         if c < 48 || c > 57 {
             return int64(0)
         }
@@ -618,7 +624,7 @@ fn drainUntilReady(c: *PgConn, res: *QueryResult, firstErr: *errors.Error) {
         }
         if m.Type == 90 { // 'Z'
             if m.BodyLen > 0 {
-                c.TxStatus = m.Body[0]
+                c.TxStatus = Skink_mem_byte(m.Body, int64(0))
             }
             return
         }

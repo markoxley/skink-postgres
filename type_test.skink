@@ -10,6 +10,12 @@ import "std/str"
 import "std/libc"
 import "std/testing"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // TestDecodeInts covers int2/int4/int8/oid text decoding.
 pub fn TestDecodeInts() {
     v := pg_type.Decode(pg_type.OID_INT4, "42", 2)
@@ -37,9 +43,9 @@ pub fn TestDecodeBytea() {
     v := pg_type.Decode(pg_type.OID_BYTEA, "\\x00ff10", 8)
     testing.AssertEqualInt(dbx_value.KIND_BLOB, v.Kind, "bytea kind")
     testing.AssertEqualInt(3, v.Len, "bytea len")
-    testing.AssertEqualInt(0, v.Str[0], "byte 0")
-    testing.AssertEqualInt(255, v.Str[1], "byte 1")
-    testing.AssertEqualInt(16, v.Str[2], "byte 2")
+    testing.AssertEqualInt(0, Skink_mem_byte(v.Str, int64(0)), "byte 0")
+    testing.AssertEqualInt(255, Skink_mem_byte(v.Str, int64(1)), "byte 1")
+    testing.AssertEqualInt(16, Skink_mem_byte(v.Str, int64(2)), "byte 2")
 }
 
 // TestDecodeText keeps numeric/uuid/json as text for precision.
@@ -102,9 +108,9 @@ pub fn TestEncodeScalars() {
 // TestEncodeBytea covers bytea param escaping.
 pub fn TestEncodeBytea() {
     raw := libc.malloc(3)
-    raw[0] = 0
-    raw[1] = 255
-    raw[2] = 0
+    Skink_mem_write_byte(raw, int64(0), 0)
+    Skink_mem_write_byte(raw, int64(1), 255)
+    Skink_mem_write_byte(raw, int64(2), 0)
     blob := dbx_value.Blob(raw, 2)
     s, n, isNull := pg_type.Encode(blob)
     testing.AssertFalse(isNull, "bytea not null")

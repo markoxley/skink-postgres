@@ -9,6 +9,12 @@ import "std/str"
 import "std/libc"
 import "std/testing"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // TestOutBufScalars verifies big-endian int16/int32 encoding.
 pub fn TestOutBufScalars() {
     b := pg_msg.NewOutBuf(8)
@@ -17,13 +23,13 @@ pub fn TestOutBufScalars() {
     pg_msg.Byte(&b, 65)
     data, n := pg_msg.Data(&b)
     testing.AssertEqualInt(7, n, "buffer length")
-    testing.AssertEqualInt(0x12, data[0], "i16 hi")
-    testing.AssertEqualInt(0x34, data[1], "i16 lo")
-    testing.AssertEqualInt(1, data[2], "i32 b0")
-    testing.AssertEqualInt(2, data[3], "i32 b1")
-    testing.AssertEqualInt(3, data[4], "i32 b2")
-    testing.AssertEqualInt(4, data[5], "i32 b3")
-    testing.AssertEqualInt(65, data[6], "byte")
+    testing.AssertEqualInt(0x12, Skink_mem_byte(data, int64(0)), "i16 hi")
+    testing.AssertEqualInt(0x34, Skink_mem_byte(data, int64(1)), "i16 lo")
+    testing.AssertEqualInt(1, Skink_mem_byte(data, int64(2)), "i32 b0")
+    testing.AssertEqualInt(2, Skink_mem_byte(data, int64(3)), "i32 b1")
+    testing.AssertEqualInt(3, Skink_mem_byte(data, int64(4)), "i32 b2")
+    testing.AssertEqualInt(4, Skink_mem_byte(data, int64(5)), "i32 b3")
+    testing.AssertEqualInt(65, Skink_mem_byte(data, int64(6)), "byte")
     pg_msg.Free(&b)
 }
 
@@ -33,21 +39,21 @@ pub fn TestOutBufScalars() {
 pub fn TestOutBufBinarySafe() {
     b := pg_msg.NewOutBuf(8)
     raw := libc.malloc(6)
-    raw[0] = 0
-    raw[1] = 1
-    raw[2] = 0
-    raw[3] = 2
-    raw[4] = 0
-    raw[5] = 0
+    Skink_mem_write_byte(raw, int64(0), 0)
+    Skink_mem_write_byte(raw, int64(1), 1)
+    Skink_mem_write_byte(raw, int64(2), 0)
+    Skink_mem_write_byte(raw, int64(3), 2)
+    Skink_mem_write_byte(raw, int64(4), 0)
+    Skink_mem_write_byte(raw, int64(5), 0)
     pg_msg.WriteN(&b, raw, 5)
     pg_msg.I32(&b, -1) // NULL param marker must encode as 0xFFFFFFFF
     data, n := pg_msg.Data(&b)
     testing.AssertEqualInt(9, n, "binary len")
-    testing.AssertEqualInt(0, data[0], "nul byte 0")
-    testing.AssertEqualInt(1, data[1], "byte 1")
-    testing.AssertEqualInt(0, data[2], "nul byte 2")
-    testing.AssertEqualInt(255, data[5], "-1 b0")
-    testing.AssertEqualInt(255, data[8], "-1 b3")
+    testing.AssertEqualInt(0, Skink_mem_byte(data, int64(0)), "nul byte 0")
+    testing.AssertEqualInt(1, Skink_mem_byte(data, int64(1)), "byte 1")
+    testing.AssertEqualInt(0, Skink_mem_byte(data, int64(2)), "nul byte 2")
+    testing.AssertEqualInt(255, Skink_mem_byte(data, int64(5)), "-1 b0")
+    testing.AssertEqualInt(255, Skink_mem_byte(data, int64(8)), "-1 b3")
     pg_msg.Free(&b)
 }
 
@@ -76,12 +82,12 @@ pub fn TestCursorRoundtrip() {
 pub fn TestCursorCBytes() {
     b := pg_msg.NewOutBuf(16)
     abcd := libc.malloc(6)
-    abcd[0] = 97
-    abcd[1] = 98
-    abcd[2] = 0
-    abcd[3] = 99
-    abcd[4] = 100
-    abcd[5] = 0
+    Skink_mem_write_byte(abcd, 0, 97)
+    Skink_mem_write_byte(abcd, 1, 98)
+    Skink_mem_write_byte(abcd, 2, 0)
+    Skink_mem_write_byte(abcd, 3, 99)
+    Skink_mem_write_byte(abcd, 4, 100)
+    Skink_mem_write_byte(abcd, 5, 0)
     pg_msg.WriteN(&b, abcd, 5)
     pg_msg.I16(&b, 7)
     body, n := pg_msg.Data(&b)
@@ -89,9 +95,9 @@ pub fn TestCursorCBytes() {
     c := pg_msg.NewCursor(body, n)
     s, got := pg_msg.CBytes(&c, 5)
     testing.AssertEqualInt(5, got, "cbytes len")
-    testing.AssertEqualInt(97, s[0], "a")
-    testing.AssertEqualInt(0, s[2], "embedded NUL")
-    testing.AssertEqualInt(100, s[4], "d")
+    testing.AssertEqualInt(97, Skink_mem_byte(s, int64(0)), "a")
+    testing.AssertEqualInt(0, Skink_mem_byte(s, int64(2)), "embedded NUL")
+    testing.AssertEqualInt(100, Skink_mem_byte(s, int64(4)), "d")
     testing.AssertEqualInt(7, pg_msg.CI16(&c), "tail i16")
     pg_msg.Free(&b)
 }

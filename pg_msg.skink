@@ -15,6 +15,12 @@ import "std/libc"
 import "std/errors"
 import "mod/markoxley/skink-dbx/dbx_bufconn"
 
+// Raw byte accessors for binary wire/test buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
+
 // Protocol version 3.0 as sent in the startup packet.
 pub const PROTOCOL_V3 = 196608
 
@@ -54,9 +60,9 @@ fn grow(b: *OutBuf, n: int) {
 // Byte appends one byte.
 pub fn Byte(b: *OutBuf, v: int) {
     grow(b, 1)
-    b.Buf[b.Len] = v & 255
+    Skink_mem_write_byte(b.Buf, int64(b.Len), v & 255)
     b.Len = b.Len + 1
-    b.Buf[b.Len] = 0
+    Skink_mem_write_byte(b.Buf, int64(b.Len), 0)
 }
 
 // I16 appends a big-endian int16.
@@ -89,7 +95,7 @@ pub fn WriteN(b: *OutBuf, s: string, n: int) {
     grow(b, n)
     libc.memcpy(string(int64(b.Buf) + int64(b.Len)), s, n)
     b.Len = b.Len + n
-    b.Buf[b.Len] = 0
+    Skink_mem_write_byte(b.Buf, int64(b.Len), 0)
 }
 
 // Data returns the accumulated bytes and their length.
@@ -119,7 +125,7 @@ pub struct Msg {
 
 // readI32 decodes a big-endian int32 at p+off.
 pub fn ReadI32(p: string, off: int) -> int {
-    return (p[off] << 24) | (p[off + 1] << 16) | (p[off + 2] << 8) | p[off + 3]
+    return (Skink_mem_byte(p, int64(off)) << 24) | (Skink_mem_byte(p, int64(off + 1)) << 16) | (Skink_mem_byte(p, int64(off + 2)) << 8) | Skink_mem_byte(p, int64(off + 3))
 }
 
 // ReadMsg reads one backend message.
@@ -190,7 +196,7 @@ pub fn CByte(c: *Cursor) -> int {
     if c.Pos >= c.Len {
         return -1
     }
-    v := c.Body[c.Pos]
+    v := Skink_mem_byte(c.Body, int64(c.Pos))
     c.Pos = c.Pos + 1
     return v
 }
@@ -200,7 +206,7 @@ pub fn CI16(c: *Cursor) -> int {
     if c.Pos + 2 > c.Len {
         return -1
     }
-    v := (c.Body[c.Pos] << 8) | c.Body[c.Pos + 1]
+    v := (Skink_mem_byte(c.Body, int64(c.Pos)) << 8) | Skink_mem_byte(c.Body, int64(c.Pos + 1))
     c.Pos = c.Pos + 2
     return v
 }
@@ -218,7 +224,7 @@ pub fn CI32(c: *Cursor) -> int {
 // CCStr reads a NUL-terminated string; returns "" when none remains.
 pub fn CCStr(c: *Cursor) -> string {
     start := c.Pos
-    for c.Pos < c.Len && c.Body[c.Pos] != 0 {
+    for c.Pos < c.Len && Skink_mem_byte(c.Body, int64(c.Pos)) != 0 {
         c.Pos = c.Pos + 1
     }
     n := c.Pos - start
@@ -226,7 +232,7 @@ pub fn CCStr(c: *Cursor) -> string {
     if n > 0 {
         libc.memcpy(out, string(int64(c.Body) + int64(start)), n)
     }
-    out[n] = 0
+    Skink_mem_write_byte(out, int64(n), 0)
     if c.Pos < c.Len {
         c.Pos = c.Pos + 1 // skip the NUL
     }
@@ -243,7 +249,7 @@ pub fn CBytes(c: *Cursor, n: int) -> (string, int) {
     }
     out := libc.malloc(n + 1)
     libc.memcpy(out, string(int64(c.Body) + int64(c.Pos)), n)
-    out[n] = 0
+    Skink_mem_write_byte(out, int64(n), 0)
     c.Pos = c.Pos + n
     return out, n
 }

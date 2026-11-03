@@ -179,7 +179,7 @@ fn authSASL(c: *dbx_bufconn.BufConn, user: string, password: string, mechMsg: pg
         if m.BodyLen > 4 {
             payload = libc.malloc(m.BodyLen - 3)
             libc.memcpy(payload, string(int64(m.Body) + int64(4)), m.BodyLen - 4)
-            payload[m.BodyLen - 4] = 0
+            Skink_mem_write_byte(payload, int64(m.BodyLen - 4), 0)
         }
         if sub == 11 {
             final, ferr := dbx_scram.HandleServerFirst(&s, payload)
